@@ -1,4 +1,4 @@
-  import os
+import os
 import requests
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -11,12 +11,6 @@ Le bot fonctionne correctement.
 
 ✅ GitHub Actions
 ✅ Telegram
-
-Prochaine étape :
-- FMP
-- Finnhub
-- Détection des actions à fort potentiel
-- Alertes automatiques
 
 Version : 0.1
 """
@@ -31,4 +25,5 @@ response = requests.post(
     }
 )
 
+print(response.status_code)
 print(response.text)
