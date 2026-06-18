@@ -19,7 +19,7 @@ OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
 OTHER_EXCHANGES = {"N", "A", "P", "Z"}
 
 SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
-USER_AGENT = "AnisTradeBot/4.0 (rising-stars)"
+USER_AGENT = "AnisTradeBot/4.1 (rising-stars)"
 
 US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "PCX", "BTS", "ASE"}
 
@@ -37,10 +37,16 @@ SCREENER_DELAY_SEC = 0.2
 # Rising Stars — profil « peut encore doubler »
 RUNNER_MIN_PRICE = 2.0
 RUNNER_MAX_PRICE = 80.0
+RUNNER_MIN_MARKET_CAP = 50_000_000
 RUNNER_MAX_MARKET_CAP = 10_000_000_000
 RUNNER_MIN_VAR20 = 15.0
 RUNNER_MAX_VAR20 = 60.0
 RUNNER_MIN_VOL_RATIO = 1.2
+RUNNER_MIN_VOL_RATIO_ANALYST = 0.3
+ANALYST_TARGET_MIN_UPSIDE = 30.0
+ANALYST_BUY_BONUS = 12
+ANALYST_UPSIDE_BONUS_CAP = 15
+BUY_RATINGS = {"buy", "strong_buy", "strongbuy", "outperform", "overweight"}
 RUNNER_MAX_DOWNLOAD = 120
 RUNNER_TOP_ALERTS = 10
 EXTENDED_TOP_ALERTS = 5
@@ -246,8 +252,9 @@ def _passes_screener_prefilter(ctx, sym, sources):
     cap = ctx.get("market_cap")
     if price is None or price < RUNNER_MIN_PRICE or price > RUNNER_MAX_PRICE:
         return False
-    if cap is not None and cap > RUNNER_MAX_MARKET_CAP:
-        return False
+    if cap is not None:
+        if cap < RUNNER_MIN_MARKET_CAP or cap > RUNNER_MAX_MARKET_CAP:
+            return False
     if _screener_priority(sym, sources) == 0 and sym not in sources["actives"]:
         return False
     return True
@@ -269,7 +276,8 @@ def build_runner_candidates(stock_quotes, nasdaq_stocks, sources):
     selected = [sym for sym, _, _, _ in candidates[:RUNNER_MAX_DOWNLOAD]]
     log(
         f"🎯 Cibles Rising Stars : {len(selected)} actions "
-        f"(prix {RUNNER_MIN_PRICE}-{RUNNER_MAX_PRICE}$, cap <{RUNNER_MAX_MARKET_CAP // 1_000_000_000}Md$)"
+        f"(prix {RUNNER_MIN_PRICE}-{RUNNER_MAX_PRICE}$, "
+        f"cap {RUNNER_MIN_MARKET_CAP // 1_000_000}-{RUNNER_MAX_MARKET_CAP // 1_000_000_000}Md$)"
     )
     return selected, {sym: ctx for sym, _, _, ctx in candidates}
 
@@ -345,7 +353,7 @@ def pct_return(series, days):
     return (float(series.iloc[-1]) / base - 1) * 100
 
 
-def runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating):
+def runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating, is_buy, target_upside):
     score = 0.0
     if var_5d is not None and var_5d > 0:
         score += min(var_5d * 1.2, 25)
@@ -361,7 +369,62 @@ def runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, acceler
         score += 8
     if accelerating:
         score += 10
+    if is_buy:
+        score += ANALYST_BUY_BONUS
+    if target_upside is not None and target_upside >= ANALYST_TARGET_MIN_UPSIDE:
+        score += min(target_upside * 0.15, ANALYST_UPSIDE_BONUS_CAP)
     return round(min(score, 100), 1)
+
+
+def fetch_analyst_meta(tickers):
+    """Couverture analyste via yfinance — buy rating et upside target."""
+    log(f"📊 Métadonnées analystes ({len(tickers)} tickers)...")
+    meta = {}
+    for i, ticker in enumerate(tickers, 1):
+        entry = {
+            "recommendation": "",
+            "is_buy": False,
+            "target": None,
+            "upside_pct": None,
+            "market_cap": None,
+        }
+        try:
+            info = yf.Ticker(to_yahoo_symbol(ticker)).info
+            rec = (info.get("recommendationKey") or "").lower()
+            target = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            entry["recommendation"] = rec
+            entry["is_buy"] = rec in BUY_RATINGS
+            entry["market_cap"] = info.get("marketCap")
+            if target and price and float(price) > 0:
+                entry["target"] = float(target)
+                entry["upside_pct"] = (float(target) / float(price) - 1) * 100
+        except Exception:
+            pass
+        meta[ticker] = entry
+        if i % 25 == 0:
+            time.sleep(0.3)
+    buys = sum(1 for m in meta.values() if m["is_buy"])
+    high_target = sum(
+        1 for m in meta.values()
+        if m.get("upside_pct") is not None and m["upside_pct"] >= ANALYST_TARGET_MIN_UPSIDE
+    )
+    log(f"   {buys} Buy | {high_target} target ≥ +{ANALYST_TARGET_MIN_UPSIDE:.0f}%")
+    return meta
+
+
+def _min_vol_ratio(analyst):
+    upside = analyst.get("upside_pct")
+    if analyst.get("is_buy") and upside is not None and upside >= ANALYST_TARGET_MIN_UPSIDE:
+        return RUNNER_MIN_VOL_RATIO_ANALYST
+    return RUNNER_MIN_VOL_RATIO
+
+
+def _passes_market_cap(analyst):
+    cap = analyst.get("market_cap")
+    if cap is None:
+        return False
+    return RUNNER_MIN_MARKET_CAP <= cap <= RUNNER_MAX_MARKET_CAP
 
 
 def get_spy_benchmark():
@@ -373,11 +436,16 @@ def get_spy_benchmark():
 
 def analyze_runners(tickers, sources, spy_ret_20d):
     log(f"📡 Analyse momentum {len(tickers)} tickers...")
+    analyst_meta = fetch_analyst_meta(tickers)
     all_closes, all_volumes, ok, fail = download_chunked(tickers, period="3mo")
     log(f"   ✅ {ok} récupérés | ❌ {fail} échecs")
 
     runners, extended = [], []
     for ticker in tickers:
+        analyst = analyst_meta.get(ticker, {})
+        if not _passes_market_cap(analyst):
+            continue
+
         c = all_closes.get(ticker)
         v = all_volumes.get(ticker)
         if c is None or v is None:
@@ -398,6 +466,9 @@ def analyze_runners(tickers, sources, spy_ret_20d):
 
         rs_20d = (var_20d - spy_ret_20d) if (var_20d is not None and spy_ret_20d is not None) else None
         is_shorted = ticker in sources["shorted"]
+        is_buy = analyst.get("is_buy", False)
+        target_upside = analyst.get("upside_pct")
+        min_vol = _min_vol_ratio(analyst)
         accelerating = (
             var_5d is not None
             and var_20d is not None
@@ -414,24 +485,31 @@ def analyze_runners(tickers, sources, spy_ret_20d):
             "RS20j": rs_20d or 0,
             "VolRatio": vol_ratio,
             "Shorted": is_shorted,
+            "AnalystBuy": is_buy,
+            "TargetUpside": target_upside,
+            "MinVolRatio": min_vol,
         }
 
         if price < RUNNER_MIN_PRICE or price > RUNNER_MAX_PRICE:
             continue
 
+        score = runner_score(
+            var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating, is_buy, target_upside
+        )
+
         if var_20d is not None and var_20d > RUNNER_MAX_VAR20:
-            row["Score"] = runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating)
+            row["Score"] = score
             extended.append(row)
             continue
 
         is_runner = (
             var_20d is not None
             and RUNNER_MIN_VAR20 <= var_20d <= RUNNER_MAX_VAR20
-            and vol_ratio >= RUNNER_MIN_VOL_RATIO
+            and vol_ratio >= min_vol
             and (rs_20d is None or rs_20d >= 0)
         )
         if is_runner:
-            row["Score"] = runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating)
+            row["Score"] = score
             runners.append(row)
 
     df_runners = pd.DataFrame(runners)
@@ -543,6 +621,12 @@ def _format_runner_line(row, options_map):
     )
     if row.get("Shorted"):
         line += " | _short_"
+    if row.get("AnalystBuy"):
+        upside = row.get("TargetUpside")
+        if upside is not None:
+            line += f" | _Buy target +{upside:.0f}%_"
+        else:
+            line += " | _Buy_"
     line += "\n"
 
     contracts = options_map.get(row["Ticker"])
@@ -560,8 +644,9 @@ def format_rising_stars_telegram(df_runners, df_extended, spy_ret_20d, options_m
     message = (
         f"🚀 *AnisTrade — RISING STARS*\n"
         f"_{spy_line} | Prix {RUNNER_MIN_PRICE:.0f}-{RUNNER_MAX_PRICE:.0f}$ | "
-        f"Cap <{RUNNER_MAX_MARKET_CAP // 1_000_000_000}Md$ | "
-        f"20j: {RUNNER_MIN_VAR20:.0f}-{RUNNER_MAX_VAR20:.0f}% | Vol≥{RUNNER_MIN_VOL_RATIO}x_\n\n"
+        f"Cap {RUNNER_MIN_MARKET_CAP // 1_000_000}-{RUNNER_MAX_MARKET_CAP // 1_000_000_000}Md$ | "
+        f"20j: {RUNNER_MIN_VAR20:.0f}-{RUNNER_MAX_VAR20:.0f}% | Vol≥{RUNNER_MIN_VOL_RATIO}x "
+        f"(≥{RUNNER_MIN_VOL_RATIO_ANALYST}x si Buy + target +{ANALYST_TARGET_MIN_UPSIDE:.0f}%)_\n\n"
     )
 
     if not df_runners.empty:
