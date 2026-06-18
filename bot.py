@@ -107,20 +107,51 @@ def log(msg):
 
 
 def send_telegram(message):
+    if not message:
+        log("⚠️ Telegram : message vide, envoi ignoré")
+        return
+
+    chunks = _split_telegram_message(message)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(
-            url,
-            json={
+    for i, chunk in enumerate(chunks, 1):
+        sent = False
+        for parse_mode in ("Markdown", None):
+            payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown",
+                "text": chunk,
                 "disable_web_page_preview": True,
-            },
-            timeout=15,
-        )
-    except Exception as e:
-        print(f"Erreur Telegram: {e}")
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            try:
+                resp = requests.post(url, json=payload, timeout=30)
+                if resp.ok:
+                    sent = True
+                    break
+                log(
+                    f"⚠️ Telegram chunk {i}/{len(chunks)} "
+                    f"({parse_mode or 'plain'}): {resp.status_code} {resp.text[:300]}"
+                )
+            except Exception as e:
+                log(f"⚠️ Telegram chunk {i}/{len(chunks)}: {e}")
+        if not sent:
+            raise RuntimeError(f"Échec envoi Telegram (chunk {i}/{len(chunks)})")
+
+
+def _split_telegram_message(message, limit=4000):
+    if len(message) <= limit:
+        return [message]
+    chunks, current = [], ""
+    for line in message.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [message[:limit]]
 
 
 def classify_sector(sector, industry):
@@ -762,8 +793,10 @@ def format_etf_section(etf_data, spy_ret_20d):
     if not etf_data:
         return ""
     message = "📊 *ETF — LONG TERME*\n"
-    spy_line = f" _(vs SPY 20j: {spy_ret_20d:+.1f}%)" if spy_ret_20d is not None else ""
-    message += f"_PEA / CTO — croissance & thématiques{spy_line}_\n\n"
+    if spy_ret_20d is not None:
+        message += f"_PEA / CTO — croissance & thématiques (vs SPY 20j: {spy_ret_20d:+.1f}%)_\n\n"
+    else:
+        message += "_PEA / CTO — croissance & thématiques_\n\n"
     for group in ("CROISSANCE", "IA", "SEMI"):
         rows = etf_data.get(group, [])
         if not rows:
@@ -971,7 +1004,7 @@ def format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20
     )
     message += _format_section_by_sector(
         df_stealth,
-        f"🕵️ *ACHATS FURTIFS* _(Vol <{STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI ≥{STEALTH_MIN_OPT_VOL_OI}x, jour>{STEALTH_MIN_VAR1D:.0f}%)_",
+        f"🕵️ *ACHATS FURTIFS* _(Vol max {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI min {STEALTH_MIN_OPT_VOL_OI}x, jour sup. {STEALTH_MIN_VAR1D:.0f}%)_",
         options_map, STEALTH_TOP_ALERTS, stealth=True,
     )
 
