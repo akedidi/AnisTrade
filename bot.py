@@ -2,7 +2,7 @@ import os
 import re
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import warnings
 import pandas as pd
@@ -21,7 +21,7 @@ OTHER_EXCHANGES = {"N", "A", "P", "Z"}
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
-USER_AGENT = "AnisTradeBot/5.0 (rising-stars)"
+USER_AGENT = "AnisTradeBot/6.0 (rising-stars)"
 
 US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "PCX", "BTS", "ASE"}
 
@@ -43,31 +43,51 @@ RUNNER_MIN_VAR20 = 15.0
 RUNNER_MAX_VAR20 = 60.0
 RUNNER_STRICT_VOL_RATIO = 1.5
 ANALYST_TARGET_MIN_UPSIDE = 30.0
-ANALYST_BUY_BONUS = 10
-ANALYST_UPSIDE_BONUS_CAP = 12
-FINNHUB_NEWS_BONUS = 8
-FINNHUB_REC_BONUS = 8
 BUY_RATINGS = {"buy", "strong_buy", "strongbuy", "outperform", "overweight"}
 RUNNER_MAX_DOWNLOAD = 120
 RUNNER_TOP_ALERTS = 15
 STEALTH_TOP_ALERTS = 10
 EXTENDED_TOP_ALERTS = 5
+EXTENDED_MIN_PRICE = 3.0
 
 STEALTH_MAX_VOL_RATIO = 1.5
 STEALTH_MIN_OPT_VOL_OI = 5.0
+STEALTH_MIN_VAR1D = -8.0
+
+SCORE_W_MOMENTUM = 0.40
+SCORE_W_ANALYST = 0.35
+SCORE_W_OPTIONS = 0.25
 
 CHUNK_SIZE = 80
 CHUNK_DELAY_SEC = 0.25
 FINNHUB_DELAY_SEC = 0.15
+NEWS_LOOKBACK_DAYS = 14
 
-SECTOR_ORDER = ["Biotech", "IA", "Industrie", "Retail", "Autre"]
+SECTOR_ORDER = ["Biotech", "IA", "Sante", "Energie", "Autre"]
 SECTOR_LABELS = {
     "Biotech": "🧬 BIOTECH",
-    "IA": "🤖 IA / TECH",
-    "Industrie": "🏭 INDUSTRIE",
-    "Retail": "🛍 RETAIL",
+    "IA": "🤖 TECH / IA",
+    "Sante": "🏥 SANTÉ",
+    "Energie": "⚡ ÉNERGIE",
     "Autre": "📦 AUTRE",
 }
+
+ETF_GROUPS = {
+    "CROISSANCE": ["QQQ", "VUG", "SCHG"],
+    "IA": ["BOTZ", "AIQ"],
+    "SEMI": ["SOXX", "SMH"],
+}
+ETF_GROUP_LABELS = {
+    "CROISSANCE": "📊 ETF CROISSANCE",
+    "IA": "📊 ETF IA",
+    "SEMI": "📊 ETF SEMI",
+}
+
+FDA_NEGATIVE_KW = (
+    "fda reject", "complete response letter", "clinical hold",
+    "trial failure", "failed to meet", "did not meet primary",
+    "phase 3 fail", "phase iii fail", "halts trial", "drug rejected",
+)
 
 OPTIONS_MAX_EXPIRATIONS = 2
 OPTIONS_MIN_VOL_OI = 2.0
@@ -106,20 +126,26 @@ def send_telegram(message):
 def classify_sector(sector, industry):
     s = (sector or "").lower()
     i = (industry or "").lower()
-    bio_kw = ("biotech", "biotechnology", "drug", "pharma", "therapeutic", "genomic")
+    bio_kw = ("biotech", "biotechnology", "genomic", "nanotechnology")
     ai_kw = ("software", "semiconductor", "internet", "cloud", "artificial", "computer", "ai ")
-    retail_kw = ("retail", "apparel", "department", "specialty", "e-commerce", "ecommerce")
+    energy_kw = ("oil", "gas", "energy", "solar", "renewable", "uranium", "coal")
 
-    if any(k in i for k in bio_kw) or (s == "healthcare" and "biotech" in i):
+    if any(k in i for k in bio_kw):
         return "Biotech"
+    sante_kw = (
+        "health information", "medical care", "hospital", "diagnostics",
+        "telehealth", "wellness", "healthcare plans", "medical devices",
+    )
+    if any(k in i for k in sante_kw):
+        return "Sante"
     if s == "healthcare":
-        return "Biotech"
+        return "Biotech" if ("drug" in i or "pharma" in i) and "biotech" in i else (
+            "Biotech" if i.startswith("biotech") else "Sante"
+        )
+    if s == "energy" or any(k in i for k in energy_kw):
+        return "Energie"
     if s == "technology" or any(k in i for k in ai_kw):
         return "IA"
-    if s == "industrials":
-        return "Industrie"
-    if s in ("consumer cyclical", "consumer defensive") or any(k in i for k in retail_kw):
-        return "Retail"
     return "Autre"
 
 
@@ -371,10 +397,13 @@ def fetch_analyst_meta(tickers):
 
 
 def fetch_finnhub_meta(tickers):
-    """Finnhub — uniquement sur les finalistes (recommendation + news sentiment)."""
+    """Finnhub — finalistes : reco, news, social, price target, alertes FDA."""
     empty = {
-        "rec_buy_pct": None, "news_score": None,
-        "bullish_pct": None, "bearish_pct": None, "finnhub_ok": False,
+        "rec_buy_pct": None, "news_score": None, "news_pct": None,
+        "bullish_pct": None, "bearish_pct": None,
+        "social_score": None, "social_pct": None,
+        "price_target": None, "price_target_upside": None,
+        "negative_fda_news": False, "finnhub_ok": False,
     }
     if not FINNHUB_API_KEY:
         log("📊 Finnhub : clé absente — sentiment ignoré")
@@ -382,6 +411,11 @@ def fetch_finnhub_meta(tickers):
 
     log(f"📊 Finnhub sentiment ({len(tickers)} finalistes)...")
     meta = {}
+    today = datetime.now().date()
+    news_from = (today - timedelta(days=NEWS_LOOKBACK_DAYS)).isoformat()
+    social_from = (today - timedelta(days=7)).isoformat()
+    news_to = social_to = today.isoformat()
+
     for i, ticker in enumerate(tickers, 1):
         entry = dict(empty)
         params = {"symbol": ticker, "token": FINNHUB_API_KEY}
@@ -396,18 +430,62 @@ def fetch_finnhub_meta(tickers):
                     if total > 0:
                         entry["rec_buy_pct"] = round(100 * buy / total, 1)
             time.sleep(FINNHUB_DELAY_SEC)
+
             news_resp = requests.get(f"{FINNHUB_BASE}/news-sentiment", params=params, timeout=10)
             if news_resp.ok:
                 news = news_resp.json()
-                entry["news_score"] = news.get("companyNewsScore")
+                ns = news.get("companyNewsScore")
+                entry["news_score"] = ns
+                if ns is not None:
+                    entry["news_pct"] = round(float(ns) * 100, 0)
                 sent = news.get("sentiment") or {}
                 entry["bullish_pct"] = sent.get("bullishPercent")
                 entry["bearish_pct"] = sent.get("bearishPercent")
+            time.sleep(FINNHUB_DELAY_SEC)
+
+            social_resp = requests.get(
+                f"{FINNHUB_BASE}/stock/social-sentiment",
+                params={**params, "from": social_from, "to": social_to},
+                timeout=10,
+            )
+            if social_resp.ok:
+                social_data = social_resp.json()
+                items = social_data if isinstance(social_data, list) else social_data.get("data", [])
+                if items:
+                    scores = [float(x.get("score", 0) or 0) for x in items if x.get("score") is not None]
+                    if scores:
+                        avg = sum(scores) / len(scores)
+                        entry["social_score"] = round(avg, 3)
+                        entry["social_pct"] = round(min(max((avg + 1) / 2 * 100, 0), 100), 0)
+            time.sleep(FINNHUB_DELAY_SEC)
+
+            pt_resp = requests.get(f"{FINNHUB_BASE}/stock/price-target", params=params, timeout=10)
+            if pt_resp.ok:
+                pt = pt_resp.json()
+                target = pt.get("targetMean") or pt.get("targetHigh")
+                if target:
+                    entry["price_target"] = float(target)
+            time.sleep(FINNHUB_DELAY_SEC)
+
+            cn_resp = requests.get(
+                f"{FINNHUB_BASE}/company-news",
+                params={**params, "from": news_from, "to": news_to},
+                timeout=10,
+            )
+            if cn_resp.ok:
+                for article in cn_resp.json() or []:
+                    headline = (article.get("headline") or "").lower()
+                    summary = (article.get("summary") or "").lower()
+                    text = f"{headline} {summary}"
+                    if any(kw in text for kw in FDA_NEGATIVE_KW):
+                        entry["negative_fda_news"] = True
+                        break
+
             entry["finnhub_ok"] = True
         except Exception as e:
             log(f"   ⚠️ Finnhub {ticker}: {e}")
         meta[ticker] = entry
-        if i % 10 == 0:
+        if i % 8 == 0:
             time.sleep(0.5)
     ok = sum(1 for m in meta.values() if m["finnhub_ok"])
     log(f"   Finnhub OK : {ok}/{len(tickers)}")
@@ -419,37 +497,89 @@ def _passes_market_cap(analyst):
     return cap is not None and RUNNER_MIN_MARKET_CAP <= cap <= RUNNER_MAX_MARKET_CAP
 
 
-def runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating, is_buy, target_upside, finnhub):
+def momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating):
     score = 0.0
     if var_5d is not None and var_5d > 0:
-        score += min(var_5d * 1.2, 25)
+        score += min(var_5d * 2.0, 30)
     if var_20d is not None and RUNNER_MIN_VAR20 <= var_20d <= RUNNER_MAX_VAR20:
-        score += min(var_20d * 0.9, 35)
-    if var_1d is not None and var_1d > 0:
-        score += min(var_1d * 1.5, 15)
+        score += min(var_20d * 1.2, 40)
+    if var_1d is not None:
+        if var_1d > 0:
+            score += min(var_1d * 2.0, 20)
+        elif var_1d <= STEALTH_MIN_VAR1D:
+            score -= 35
+        elif var_1d < 0:
+            score -= 12
     if rs_20d is not None and rs_20d > 0:
-        score += min(rs_20d * 0.5, 15)
+        score += min(rs_20d * 0.6, 15)
     if vol_ratio is not None and vol_ratio >= RUNNER_STRICT_VOL_RATIO:
-        score += min((vol_ratio - 1) * 8, 15)
+        score += min((vol_ratio - 1) * 10, 15)
     if is_shorted:
-        score += 8
+        score += 5
     if accelerating:
-        score += 10
+        score += 8
+    return round(min(max(score, 0), 100), 0)
+
+
+def analyst_score(is_buy, target_upside, price, finnhub):
+    score = 0.0
     if is_buy:
-        score += ANALYST_BUY_BONUS
-    if target_upside is not None and target_upside >= ANALYST_TARGET_MIN_UPSIDE:
-        score += min(min(target_upside, 80) * 0.12, ANALYST_UPSIDE_BONUS_CAP)
+        score += 40
+    upside = target_upside
+    if finnhub and finnhub.get("price_target") and price and float(price) > 0:
+        fh_up = (finnhub["price_target"] / float(price) - 1) * 100
+        upside = fh_up if upside is None else max(upside, fh_up)
+    if upside is not None:
+        if upside >= 100:
+            score += 40
+        elif upside >= 50:
+            score += 30
+        elif upside >= ANALYST_TARGET_MIN_UPSIDE:
+            score += 20
+        elif upside > 0:
+            score += 10
     if finnhub:
-        ns = finnhub.get("news_score")
-        if ns is not None and ns >= 0.55:
-            score += FINNHUB_NEWS_BONUS
         rb = finnhub.get("rec_buy_pct")
-        if rb is not None and rb >= 60:
-            score += FINNHUB_REC_BONUS
+        if rb is not None:
+            score += min(rb * 0.35, 25)
         bp = finnhub.get("bearish_pct")
         if bp is not None and bp >= 0.55:
-            score -= 10
-    return round(min(max(score, 0), 100), 1)
+            score -= 20
+        if finnhub.get("negative_fda_news"):
+            score -= 30
+    return round(min(max(score, 0), 100), 0)
+
+
+def options_score(top_vol_oi):
+    if not top_vol_oi:
+        return 0
+    if top_vol_oi >= 15:
+        return 100
+    if top_vol_oi >= 10:
+        return 85
+    if top_vol_oi >= STEALTH_MIN_OPT_VOL_OI:
+        return round(min(50 + (top_vol_oi - STEALTH_MIN_OPT_VOL_OI) * 7, 80), 0)
+    return round(min(top_vol_oi * 10, 45), 0)
+
+
+def global_score(momentum, analyst, options):
+    return round(
+        SCORE_W_MOMENTUM * (momentum or 0)
+        + SCORE_W_ANALYST * (analyst or 0)
+        + SCORE_W_OPTIONS * (options or 0),
+        0,
+    )
+
+
+def compute_scores(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating,
+                   is_buy, target_upside, price, finnhub, top_vol_oi=None):
+    accelerating = accelerating or (
+        var_5d is not None and var_20d is not None and var_5d > 0 and var_5d > (var_20d / 4)
+    )
+    m = momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating)
+    a = analyst_score(is_buy, target_upside, price, finnhub)
+    o = options_score(top_vol_oi)
+    return m, a, o, global_score(m, a, o)
 
 
 def get_spy_benchmark():
@@ -459,13 +589,14 @@ def get_spy_benchmark():
     return pct_return(closes["SPY"], 20)
 
 
-def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, finnhub, spy_ret_20d):
+def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, finnhub, spy_ret_20d, top_vol_oi=None):
     is_shorted = ticker in sources["shorted"]
     accelerating = var_5d is not None and var_20d is not None and var_5d > 0 and var_5d > (var_20d / 4)
-    score = runner_score(
+    m, a, o, g = compute_scores(
         var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating,
-        analyst.get("is_buy", False), analyst.get("upside_pct"), finnhub,
+        analyst.get("is_buy", False), analyst.get("upside_pct"), price, finnhub, top_vol_oi,
     )
+    fh = finnhub or {}
     return {
         "Ticker": ticker,
         "Prix": price,
@@ -478,10 +609,17 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
         "AnalystBuy": analyst.get("is_buy", False),
         "TargetUpside": analyst.get("upside_pct"),
         "Category": analyst.get("category", "Autre"),
-        "Score": score,
-        "NewsScore": finnhub.get("news_score") if finnhub else None,
-        "RecBuyPct": finnhub.get("rec_buy_pct") if finnhub else None,
-        "BullishPct": finnhub.get("bullish_pct") if finnhub else None,
+        "MomentumScore": m,
+        "AnalystScore": a,
+        "OptionsScore": o,
+        "Score": g,
+        "TopVolOI": top_vol_oi,
+        "NewsScore": fh.get("news_score"),
+        "NewsPct": fh.get("news_pct"),
+        "RecBuyPct": fh.get("rec_buy_pct"),
+        "SocialPct": fh.get("social_pct"),
+        "BullishPct": fh.get("bullish_pct"),
+        "NegativeFdaNews": fh.get("negative_fda_news", False),
     }
 
 
@@ -514,7 +652,8 @@ def analyze_candidates(tickers, sources, spy_ret_20d):
         rs_20d = (var_20d - spy_ret_20d) if (var_20d is not None and spy_ret_20d is not None) else None
 
         if var_20d is not None and var_20d > RUNNER_MAX_VAR20:
-            extended.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, spy_ret_20d))
+            if price >= EXTENDED_MIN_PRICE:
+                extended.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, spy_ret_20d))
             continue
 
         if var_20d is None or var_20d < RUNNER_MIN_VAR20 or (rs_20d is not None and rs_20d < 0):
@@ -553,29 +692,112 @@ def enrich_with_finnhub(df_runners, df_stealth, df_extended):
 
     fh = fetch_finnhub_meta(sorted(tickers))
 
-    def _apply(df):
+    def _apply(df, options_map=None):
         if df.empty:
             return df
         rows = []
         for _, row in df.iterrows():
             r = row.to_dict()
             meta = fh.get(r["Ticker"], {})
-            r["NewsScore"] = meta.get("news_score")
-            r["RecBuyPct"] = meta.get("rec_buy_pct")
-            r["BullishPct"] = meta.get("bullish_pct")
-            if meta.get("finnhub_ok"):
-                r["Score"] = runner_score(
-                    r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
-                    r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
-                    r["AnalystBuy"], r["TargetUpside"], meta,
-                )
+            top_vol_oi = r.get("TopVolOI")
+            if options_map and r["Ticker"] in options_map:
+                contracts = options_map[r["Ticker"]]
+                if contracts:
+                    top_vol_oi = contracts[0]["vol_oi"]
+            m, a, o, g = compute_scores(
+                r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
+                r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
+                r["AnalystBuy"], r["TargetUpside"], r["Prix"], meta, top_vol_oi,
+            )
+            r.update({
+                "MomentumScore": m, "AnalystScore": a, "OptionsScore": o, "Score": g,
+                "TopVolOI": top_vol_oi,
+                "NewsScore": meta.get("news_score"),
+                "NewsPct": meta.get("news_pct"),
+                "RecBuyPct": meta.get("rec_buy_pct"),
+                "SocialPct": meta.get("social_pct"),
+                "BullishPct": meta.get("bullish_pct"),
+                "NegativeFdaNews": meta.get("negative_fda_news", False),
+            })
             rows.append(r)
         out = pd.DataFrame(rows)
-        if not out.empty and "Score" in out.columns:
+        if not out.empty:
             out = out.sort_values(by=["Score", "Var20j"], ascending=False)
         return out
 
     return _apply(df_runners), _apply(df_stealth), _apply(df_extended)
+
+
+def analyze_etf_watchlist(spy_ret_20d):
+    symbols = [s for group in ETF_GROUPS.values() for s in group]
+    log(f"📊 ETF watchlist ({len(symbols)} tickers)...")
+    closes, _, ok, fail = download_chunked(symbols, period="3mo")
+    log(f"   ETF : ✅ {ok} | ❌ {fail}")
+    results = {}
+    for group, tickers in ETF_GROUPS.items():
+        rows = []
+        for sym in tickers:
+            c = closes.get(sym)
+            if c is None:
+                continue
+            c = c.dropna()
+            if len(c) < 22:
+                continue
+            price = float(c.iloc[-1])
+            var_1d = pct_return(c, 1) or 0
+            var_5d = pct_return(c, 5) or 0
+            var_20d = pct_return(c, 20) or 0
+            rs_20d = (var_20d - spy_ret_20d) if spy_ret_20d is not None else None
+            rows.append({
+                "Ticker": sym, "Prix": price,
+                "Var1j": var_1d, "Var5j": var_5d, "Var20j": var_20d,
+                "RS20j": rs_20d or 0,
+            })
+        if rows:
+            results[group] = sorted(rows, key=lambda x: x["Var20j"], reverse=True)
+    return results
+
+
+def format_etf_section(etf_data, spy_ret_20d):
+    if not etf_data:
+        return ""
+    message = "📊 *ETF — LONG TERME*\n"
+    spy_line = f" _(vs SPY 20j: {spy_ret_20d:+.1f}%)" if spy_ret_20d is not None else ""
+    message += f"_PEA / CTO — croissance & thématiques{spy_line}_\n\n"
+    for group in ("CROISSANCE", "IA", "SEMI"):
+        rows = etf_data.get(group, [])
+        if not rows:
+            continue
+        message += f"*{ETF_GROUP_LABELS[group]}*\n"
+        for row in rows:
+            rs = f" | RS:{row['RS20j']:+.1f}%" if row.get("RS20j") else ""
+            message += (
+                f"_{row['Ticker']}_ {row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | "
+                f"20j:{row['Var20j']:+.1f}%{rs} | {row['Prix']:.2f}$\n"
+            )
+        message += "\n"
+    return message
+
+
+def apply_options_scores(df, options_map):
+    if df.empty:
+        return df
+    rows = []
+    for _, row in df.iterrows():
+        r = row.to_dict()
+        top_vol_oi = None
+        contracts = options_map.get(r["Ticker"])
+        if contracts:
+            top_vol_oi = contracts[0]["vol_oi"]
+        m, a, o, g = compute_scores(
+            r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
+            r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
+            r["AnalystBuy"], r["TargetUpside"], r["Prix"], {}, top_vol_oi,
+        )
+        r.update({"MomentumScore": m, "AnalystScore": a, "OptionsScore": o, "Score": g, "TopVolOI": top_vol_oi})
+        rows.append(r)
+    out = pd.DataFrame(rows)
+    return out.sort_values(by=["Score", "Var20j"], ascending=False) if not out.empty else out
 
 
 def short_expiry(exp_str):
@@ -650,6 +872,8 @@ def build_stealth_df(df_pool, options_map):
         return pd.DataFrame()
     rows = []
     for _, row in df_pool.iterrows():
+        if row["Var1j"] <= STEALTH_MIN_VAR1D:
+            continue
         contracts = options_map.get(row["Ticker"])
         if not contracts:
             continue
@@ -669,9 +893,16 @@ def _format_sentiment_tags(row):
     if row.get("AnalystBuy"):
         up = row.get("TargetUpside")
         tags.append(f"Buy +{up:.0f}%" if up is not None else "Buy")
-    ns = row.get("NewsScore")
-    if ns is not None:
-        tags.append(f"News:{ns:.2f}")
+    np_ = row.get("NewsPct")
+    if np_ is not None:
+        tags.append(f"📰 News:+{np_:.0f}")
+    elif row.get("NewsScore") is not None:
+        tags.append(f"📰 News:{row['NewsScore']:.2f}")
+    if row.get("NegativeFdaNews"):
+        tags.append("📰 News négatives FDA")
+    sp = row.get("SocialPct")
+    if sp is not None:
+        tags.append(f"🐦 Social:+{sp:.0f}")
     rb = row.get("RecBuyPct")
     if rb is not None:
         tags.append(f"FH:{rb:.0f}%Buy")
@@ -680,7 +911,11 @@ def _format_sentiment_tags(row):
 
 def _format_stock_line(row, options_map, stealth=False):
     line = (
-        f"*{row['Ticker']}* Score:{row['Score']:.0f} | "
+        f"*{row['Ticker']}*\n"
+        f"_Momentum: {row.get('MomentumScore', 0):.0f} | "
+        f"Analystes: {row.get('AnalystScore', 0):.0f} | "
+        f"Options: {row.get('OptionsScore', 0):.0f}_\n"
+        f"_Score global: {row.get('Score', 0):.0f}_\n"
         f"{row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | 20j:{row['Var20j']:+.1f}% | "
         f"Vol:{row['VolRatio']:.1f}x | {row['Prix']:.2f}$"
     )
@@ -692,10 +927,9 @@ def _format_stock_line(row, options_map, stealth=False):
     if contracts:
         c = contracts[0]
         prefix = "🕵️" if stealth else "🐳"
-        warn = " ⚠️jour<0" if stealth and row["Var1j"] < 0 else ""
         line += (
             f"   {prefix} CALL {c['strike']:.1f} OTM +{c['otm_pct']:.0f}% {short_expiry(c['expiry'])} | "
-            f"Vol:{c['volume']:,} > OI:{c['oi']:,} | {c['vol_oi']:.1f}x{warn}\n"
+            f"Vol:{c['volume']:,} > OI:{c['oi']:,} | {c['vol_oi']:.1f}x\n"
         )
     return line
 
@@ -719,14 +953,16 @@ def _format_section_by_sector(df, title, options_map, max_n, stealth=False):
     return message + "\n"
 
 
-def format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20d, options_map):
+def format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20d, options_map, etf_data):
     spy_line = f"SPY 20j: {spy_ret_20d:+.1f}%" if spy_ret_20d is not None else ""
     fh_note = "Finnhub ✅" if FINNHUB_API_KEY else "Finnhub off"
     message = (
-        f"🚀 *AnisTrade — RISING STARS v5*\n"
+        f"🚀 *AnisTrade — RISING STARS v6*\n"
         f"_{spy_line} | Cap ≥{RUNNER_MIN_MARKET_CAP // 1_000_000}M$ | "
         f"Runners: Vol≥{RUNNER_STRICT_VOL_RATIO}x & jour>0 | {fh_note}_\n\n"
     )
+
+    message += format_etf_section(etf_data, spy_ret_20d)
 
     message += _format_section_by_sector(
         df_runners,
@@ -735,7 +971,7 @@ def format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20
     )
     message += _format_section_by_sector(
         df_stealth,
-        f"🕵️ *ACHATS FURTIFS* _(Vol action <{STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI ≥{STEALTH_MIN_OPT_VOL_OI}x)_",
+        f"🕵️ *ACHATS FURTIFS* _(Vol <{STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI ≥{STEALTH_MIN_OPT_VOL_OI}x, jour>{STEALTH_MIN_VAR1D:.0f}%)_",
         options_map, STEALTH_TOP_ALERTS, stealth=True,
     )
 
@@ -772,10 +1008,14 @@ def main():
     options_stealth = scan_options_for_df(df_stealth_pool, "furtif")
     options_map = {**options_runners, **options_stealth}
 
+    df_runners = apply_options_scores(df_runners, options_map)
     df_stealth = build_stealth_df(df_stealth_pool, options_map)
+    df_stealth = apply_options_scores(df_stealth, options_map)
     df_runners, df_stealth, df_extended = enrich_with_finnhub(df_runners, df_stealth, df_extended)
 
-    message = format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20d, options_map)
+    etf_data = analyze_etf_watchlist(spy_ret_20d)
+
+    message = format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20d, options_map, etf_data)
     send_telegram(message)
     log("🚀 Alerte Rising Stars envoyée !")
 
