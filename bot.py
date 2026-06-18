@@ -1,218 +1,127 @@
 import os
 import time
-import random
 import requests
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TOP_ACTIONS = 10
-TOP_ETFS = 10
-MAX_SYMBOLS_TO_SCAN = 120
-
+WATCHLIST = ["BHVN", "QURE", "XBI", "LABU", "IBB", "GILD", "AMGN", "BIIB", "VRTX", "REGN"]
 FINNHUB_BASE = "https://finnhub.io/api/v1"
-
 
 def finnhub_get(endpoint, params=None):
     if params is None:
         params = {}
-
     params["token"] = FINNHUB_API_KEY
     url = f"{FINNHUB_BASE}/{endpoint}"
-
-    r = requests.get(url, params=params, timeout=20)
-    print(endpoint, r.status_code)
-
-    if r.status_code != 200:
-        print(r.text[:500])
-        return None
-
-    return r.json()
-
+    
+    # Système de "Retry" pour absorber les blocages temporaires de la version gratuite
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            elif r.status_code == 429:
+                print(f"⚠️ Limite API atteinte (429). Pause de 10s... (Essai {attempt + 1}/{max_retries})")
+                time.sleep(10)
+            else:
+                print(f"Erreur API {endpoint} - Code: {r.status_code}")
+                break
+        except Exception as e:
+            print(f"Erreur de connexion API {endpoint}: {e}")
+            time.sleep(2)
+            
+    return None
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True
+            },
+            timeout=15
+        )
+    except Exception as e:
+        print(f"Erreur Telegram: {e}")
 
-    r = requests.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True
-        },
-        timeout=20
-    )
-
-    print("Telegram:", r.status_code)
-    print(r.text[:500])
-
-
-def get_all_us_symbols():
-    data = finnhub_get("stock/symbol", {"exchange": "US"})
-
-    if not isinstance(data, list):
-        return [], []
-
-    actions = []
-    etfs = []
-
-    for item in data:
-        symbol = item.get("symbol")
-        description = item.get("description", "")
-        security_type = (item.get("type") or "").upper()
-
-        if not symbol:
-            continue
-
-        if "." in symbol or "-" in symbol:
-            continue
-
-        if security_type == "ETF":
-            etfs.append({
-                "symbol": symbol,
-                "name": description
-            })
-
-        elif security_type in ["COMMON STOCK", "ADR", "REIT"]:
-            actions.append({
-                "symbol": symbol,
-                "name": description
-            })
-
-    random.shuffle(actions)
-    random.shuffle(etfs)
-
-    return actions[:MAX_SYMBOLS_TO_SCAN], etfs[:MAX_SYMBOLS_TO_SCAN]
-
-
-def get_quote(symbol):
-    return finnhub_get("quote", {"symbol": symbol})
-
-
-def score_item(symbol, name, quote, is_etf=False):
+def check_volume_spike(symbol):
+    quote = finnhub_get("quote", {"symbol": symbol})
     if not quote:
         return None
-
-    current = quote.get("c") or 0
-    high = quote.get("h") or 0
-    low = quote.get("l") or 0
-    open_price = quote.get("o") or 0
-    previous_close = quote.get("pc") or 0
-
-    if current <= 0 or previous_close <= 0:
+        
+    current_price = quote.get("c", 0)
+    previous_close = quote.get("pc", 0)
+    
+    # Protection stricte contre la division par zéro
+    if previous_close == 0:
+        print(f"Données de clôture indisponibles pour {symbol}.")
+        return None
+        
+    daily_change = ((current_price - previous_close) / previous_close) * 100
+    
+    # Si le prix ne bouge pas assez, on économise un appel API sur le profil
+    if daily_change < 5.0:
         return None
 
-    daily_change = ((current - previous_close) / previous_close) * 100
-
-    intraday_range = 0
-    if low > 0:
-        intraday_range = ((high - low) / low) * 100
-
-    score = 0
-
-    # Momentum positif mais pas délirant
-    if 0 < daily_change <= 8:
-        score += 45
-    elif 8 < daily_change <= 15:
-        score += 25
-    elif -3 <= daily_change <= 0:
-        score += 20
-
-    # Volatilité utile
-    if 2 <= intraday_range <= 12:
-        score += 25
-    elif 12 < intraday_range <= 20:
-        score += 15
-
-    # Prix accessible
-    if not is_etf:
-        if current < 10:
-            score += 20
-        elif current < 50:
-            score += 15
-        elif current < 100:
-            score += 5
+    # Récupération du profil uniquement si l'anomalie de prix est validée
+    profile = finnhub_get("stock/profile2", {"symbol": symbol})
+    
+    # Gestion des profils introuvables (fréquent sur les small caps en API gratuite)
+    if profile:
+        market_cap = profile.get("marketCapitalization", 0)
+        name = profile.get("name", symbol)
     else:
-        if 20 <= current <= 500:
-            score += 20
-        else:
-            score += 10
+        market_cap = 0
+        name = symbol
 
-    # Bonus ETF plus stable
-    if is_etf:
-        score += 10
-
-    return {
-        "symbol": symbol,
-        "name": name[:45],
-        "price": round(current, 2),
-        "change": round(daily_change, 2),
-        "range": round(intraday_range, 2),
-        "score": round(score, 1)
-    }
-
-
-def scan(items, is_etf=False):
-    results = []
-
-    for item in items:
-        symbol = item["symbol"]
-        name = item["name"]
-
-        quote = get_quote(symbol)
-        scored = score_item(symbol, name, quote, is_etf=is_etf)
-
-        if scored:
-            results.append(scored)
-
-        time.sleep(1.1)  # respecte la limite gratuite Finnhub ~60 appels/min
-
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
-
-    return results
-
-
-def format_section(title, items):
-    text = f"{title}\n\n"
-
-    if not items:
-        return text + "Aucun résultat.\n\n"
-
-    for i, item in enumerate(items, start=1):
-        text += (
-            f"{i}. {item['symbol']} - {item['name']}\n"
-            f"Prix: {item['price']}$ | Variation: {item['change']}%\n"
-            f"Range jour: {item['range']}% | Score: {item['score']}/100\n\n"
-        )
-
-    return text
-
+    # Filtre Quantitatif : Capitalisation < 50B$ ou inconnue (0)
+    if market_cap < 50000:
+        return {
+            "symbol": symbol,
+            "name": name,
+            "price": current_price,
+            "change": round(daily_change, 2),
+            "cap": round(market_cap / 1000, 2) if market_cap > 0 else "Inconnue"
+        }
+        
+    return None
 
 def main():
-    if not FINNHUB_API_KEY:
-        raise Exception("FINNHUB_API_KEY manquant")
-    if not TELEGRAM_TOKEN:
-        raise Exception("TELEGRAM_TOKEN manquant")
-    if not TELEGRAM_CHAT_ID:
-        raise Exception("TELEGRAM_CHAT_ID manquant")
+    if not all([FINNHUB_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+        raise Exception("Variables d'environnement manquantes.")
 
-    actions, etfs = get_all_us_symbols()
+    alerts = []
+    print(f"Début du scan quantitatif sur {len(WATCHLIST)} actifs...")
 
-    print("Actions à scanner:", len(actions))
-    print("ETF à scanner:", len(etfs))
+    for symbol in WATCHLIST:
+        print(f"Analyse de {symbol}...")
+        result = check_volume_spike(symbol)
+        if result:
+            alerts.append(result)
+            
+        # Temporisation dynamique pour la version gratuite
+        time.sleep(1.5) 
 
-    scored_actions = scan(actions, is_etf=False)[:TOP_ACTIONS]
-    scored_etfs = scan(etfs, is_etf=True)[:TOP_ETFS]
-
-    message = "🚀 AnisTrade - Scan générique Finnhub\n\n"
-    message += format_section("📈 ACTIONS", scored_actions)
-    message += format_section("📊 ETF", scored_etfs)
-    message += "⚠️ Signal indicatif, pas un conseil financier."
-
-    # Telegram limite les messages à ~4096 caractères
-    send_telegram(message[:3900])
-
+    if alerts:
+        message = "🚨 *AnisTrade - Détection d'Anomalie Institutionnelle*\n\n"
+        for alert in alerts:
+            cap_display = f"{alert['cap']}B$" if isinstance(alert['cap'], float) else alert['cap']
+            message += (
+                f"🔥 *{alert['symbol']}* - {alert['name']}\n"
+                f" Prix : {alert['price']}$ | Mouvement : +{alert['change']}%\n"
+                f" Capitalisation : {cap_display}\n\n"
+            )
+        message += "⚠️ _Vérifier immédiatement le ratio Vol/OI des options sur cet actif._"
+        send_telegram(message)
+        print("Alerte envoyée sur Telegram.")
+    else:
+        print("Aucune anomalie détectée.")
 
 if __name__ == "__main__":
     main()
