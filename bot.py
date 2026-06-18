@@ -12,17 +12,17 @@ import yfinance as yf
 warnings.simplefilter(action="ignore", category=FutureWarning)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Bourses US majeures uniquement (exclut OTC / pink sheets)
-MAJOR_MICS = {"XNYS", "XNAS", "ARCX", "BATS", "XASE"}
-STOCK_TYPES = {"COMMON STOCK", "ADR", "REIT", "EQS"}
-ETF_TYPES = {"ETF", "ETP", "ETN"}
+NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+# otherlisted Exchange : N=NYSE, A=AMEX, P=ARCA, Z=BATS
+OTHER_EXCHANGES = {"N", "A", "P", "Z"}
+
 SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
 
-# ETF majeurs (Finnhub ne tague plus type=ETF sur /stock/symbol)
+# ETF majeurs — toujours scannés (les milliers d'ETF NASDAQ ne sont pas tous téléchargés)
 CORE_ETFS = [
     "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV", "VEA", "VWO", "AGG",
     "BND", "TLT", "GLD", "SLV", "USO", "UNG", "XLK", "XLF", "XLE", "XLV",
@@ -36,8 +36,16 @@ CORE_ETFS = [
     "IYR", "VNQ", "SCHH", "REM", "MORT", "EMB", "VTEB", "MUB", "PFF", "PGX",
 ]
 
-CHUNK_SIZE = 80
-CHUNK_DELAY_SEC = 0.4
+CHUNK_SIZE = 100
+CHUNK_DELAY_SEC = 0.25
+
+# Univers scan — core toujours inclus, extended filtré par liquidité
+WATCHLIST = ["BHVN"]  # mid-caps à toujours inclure
+MIN_AVG_VOLUME = 400_000
+MIN_PRICE = 2.0
+MAX_EXTENDED_LIQUID = 1500
+PREFILTER_PERIOD = "5d"
+USE_EXTENDED_LIQUID_SCAN = False  # True = +1500 mid-caps (plus lent, ~15 min)
 
 # Options — scan uniquement sur les finalistes momentum
 OPTIONS_MAX_EXPIRATIONS = 2
@@ -53,6 +61,10 @@ def to_yahoo_symbol(symbol: str) -> str:
 
 def from_yahoo_symbol(symbol: str) -> str:
     return symbol.replace("-", ".")
+
+
+def log(msg):
+    print(msg, flush=True)
 
 
 def send_telegram(message):
@@ -96,68 +108,231 @@ def fetch_index_tickers():
     return stocks
 
 
-def fetch_finnhub_symbols():
-    print("📥 Récupération annuaire US via Finnhub...")
-    url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_API_KEY}"
+def fetch_nasdaq_trader_file(url):
+    headers = {"User-Agent": "AnisTradeBot/2.0 (momentum-scanner)"}
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+
+def _parse_nasdaq_row(row, stocks, etfs, stats_key):
+    symbol = row.get("Symbol", "").strip().upper()
+    if not SYMBOL_RE.match(symbol):
+        return
+    if row.get("Test Issue", "").strip().upper() == "Y":
+        return
+    if row.get("ETF", "").strip().upper() == "Y":
+        etfs.add(symbol)
+        stats_key["etfs"] += 1
+    else:
+        stocks.add(symbol)
+        stats_key["stocks"] += 1
+
+
+def _parse_other_row(row, stocks, etfs, stats_key):
+    symbol = row.get("ACT Symbol", "").strip().upper()
+    if not SYMBOL_RE.match(symbol):
+        return
+    if row.get("Exchange", "").strip().upper() not in OTHER_EXCHANGES:
+        stats_key["skipped_exchange"] += 1
+        return
+    if row.get("Test Issue", "").strip().upper() == "Y":
+        return
+    if row.get("ETF", "").strip().upper() == "Y":
+        etfs.add(symbol)
+        stats_key["etfs"] += 1
+    else:
+        stocks.add(symbol)
+        stats_key["stocks"] += 1
+
+
+def fetch_nasdaq_trader_symbols():
+    """Annuaire officiel US — 2 fichiers TXT gratuits, mis à jour chaque nuit."""
+    log("📥 Téléchargement annuaire NASDAQ Trader (2 fichiers)...")
+    stocks = set()
+    etfs = set()
+    stats = {"stocks": 0, "etfs": 0, "skipped_exchange": 0}
+
     try:
-        r = requests.get(url, timeout=20)
-        if r.status_code != 200:
-            print(f"Erreur Finnhub code {r.status_code}")
-            return []
-        return r.json()
+        nasdaq_text = fetch_nasdaq_trader_file(NASDAQ_LISTED_URL)
+        for line in nasdaq_text.splitlines():
+            if not line or line.startswith("Symbol|") or line.startswith("File Creation"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+            _parse_nasdaq_row(
+                {
+                    "Symbol": parts[0],
+                    "Test Issue": parts[3],
+                    "ETF": parts[6],
+                },
+                stocks,
+                etfs,
+                stats,
+            )
+
+        other_text = fetch_nasdaq_trader_file(OTHER_LISTED_URL)
+        for line in other_text.splitlines():
+            if not line or line.startswith("ACT Symbol|") or line.startswith("File Creation"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+            _parse_other_row(
+                {
+                    "ACT Symbol": parts[0],
+                    "Exchange": parts[2],
+                    "ETF": parts[4],
+                    "Test Issue": parts[6],
+                },
+                stocks,
+                etfs,
+                stats,
+            )
     except Exception as e:
-        print(f"Erreur Finnhub: {e}")
+        log(f"⚠️ Erreur NASDAQ Trader: {e}")
+        return set(), set()
+
+    log(
+        f"   NASDAQ Trader : {len(stocks)} actions, {len(etfs)} ETF "
+        f"(brut {stats['stocks']}+{stats['etfs']}, exchanges ignorés: {stats['skipped_exchange']})"
+    )
+    return stocks, etfs
+
+
+def filter_liquid_tickers(tickers):
+    """Pré-filtre rapide 5j — s'arrête dès que MAX_EXTENDED_LIQUID titres liquides trouvés."""
+    if not tickers:
         return []
+
+    yahoo_tickers = [to_yahoo_symbol(t) for t in tickers]
+    yahoo_to_orig = {to_yahoo_symbol(t): t for t in tickers}
+    total_chunks = (len(yahoo_tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    log(
+        f"   Pré-filtre liquidité ({PREFILTER_PERIOD}) sur {len(tickers)} tickers "
+        f"(early-stop à {MAX_EXTENDED_LIQUID})..."
+    )
+
+    candidates = []
+    ok, fail = 0, 0
+
+    for i in range(0, len(yahoo_tickers), CHUNK_SIZE):
+        chunk = yahoo_tickers[i : i + CHUNK_SIZE]
+        chunk_num = i // CHUNK_SIZE + 1
+        log(f"   Pré-filtre lot {chunk_num}/{total_chunks}...")
+
+        try:
+            data = yf.download(
+                chunk,
+                period=PREFILTER_PERIOD,
+                progress=False,
+                ignore_tz=True,
+                threads=False,
+                auto_adjust=True,
+            )
+        except Exception:
+            fail += len(chunk)
+            time.sleep(CHUNK_DELAY_SEC)
+            continue
+
+        if data is None or data.empty or "Close" not in data:
+            fail += len(chunk)
+            time.sleep(CHUNK_DELAY_SEC)
+            continue
+
+        closes = data["Close"]
+        volumes = data["Volume"]
+
+        def process_series(yt, c_series, v_series):
+            nonlocal ok, fail
+            orig = yahoo_to_orig.get(yt, yt)
+            try:
+                c = c_series.dropna()
+                v = v_series.dropna()
+                if len(c) < 2 or len(v) < 2:
+                    fail += 1
+                    return
+                price = float(c.iloc[-1])
+                avg_vol = float(v.mean())
+                if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
+                    candidates.append((orig, avg_vol))
+                ok += 1
+            except Exception:
+                fail += 1
+
+        if isinstance(closes, pd.Series):
+            process_series(chunk[0], closes, volumes)
+        else:
+            for yt in chunk:
+                if yt not in closes.columns:
+                    fail += 1
+                    continue
+                process_series(yt, closes[yt], volumes[yt])
+
+        if len(candidates) >= MAX_EXTENDED_LIQUID:
+            log(f"   Early-stop pré-filtre lot {chunk_num}/{total_chunks} ({len(candidates)} liquides)")
+            break
+
+        time.sleep(CHUNK_DELAY_SEC)
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    selected = [t for t, _ in candidates[:MAX_EXTENDED_LIQUID]]
+    log(f"   Pré-filtre : {len(selected)} retenus | {ok} ok | {fail} échecs")
+    return selected
+
+
+def prepare_scan_universe(stock_list, etf_list, index_stocks):
+    """
+    Core (indices + watchlist) toujours scanné.
+    Extended : actions hors core, filtrées par liquidité.
+    ETF : CORE_ETFS uniquement (pas les milliers d'ETF du fichier NASDAQ).
+    """
+    all_stocks = set(stock_list)
+    core = (set(index_stocks) | set(WATCHLIST)) & all_stocks
+    for sym in WATCHLIST:
+        if sym.upper() not in all_stocks:
+            log(f"   ⚠️ WATCHLIST {sym} absent de l'annuaire NASDAQ")
+
+    extended = sorted(all_stocks - core)
+    if USE_EXTENDED_LIQUID_SCAN and extended:
+        liquid_extended = filter_liquid_tickers(extended)
+    else:
+        liquid_extended = []
+        if extended and not USE_EXTENDED_LIQUID_SCAN:
+            log(f"   Extended désactivé ({len(extended)} actions hors core ignorées)")
+    scan_stocks = sorted(core | set(liquid_extended))
+
+    scan_etfs = sorted(set(CORE_ETFS))
+
+    log(
+        f"🎯 Scan cible : {len(scan_stocks)} actions "
+        f"(core {len(core)} + liquidité {len(liquid_extended)}) | "
+        f"{len(scan_etfs)} ETF"
+    )
+    return scan_stocks, scan_etfs, core
 
 
 def build_universe():
     """
-    Univers déterministe : indices de référence + Finnhub filtré (NYSE/NASDAQ/ARCA).
-    Plus d'échantillon aléatoire — BHVN et les titres liquides sont toujours inclus.
+    Univers via NASDAQ Trader (2 fichiers) + indices Wikipedia.
     """
     index_stocks = fetch_index_tickers()
-    finnhub = fetch_finnhub_symbols()
+    nasdaq_stocks, nasdaq_etfs = fetch_nasdaq_trader_symbols()
 
-    stocks = set(index_stocks)
-    etfs = set(CORE_ETFS)
-
-    finnhub_stocks = 0
-    finnhub_etfs = 0
-    skipped_otc = 0
-
-    for item in finnhub:
-        symbol = item.get("symbol", "").upper().strip()
-        sec_type = item.get("type", "").upper().strip()
-        mic = item.get("mic", "").upper().strip()
-
-        if not SYMBOL_RE.match(symbol):
-            continue
-        if mic:
-            if mic not in MAJOR_MICS:
-                skipped_otc += 1
-                continue
-        elif sec_type not in STOCK_TYPES and sec_type not in ETF_TYPES:
-            continue
-
-        if sec_type in ETF_TYPES or mic == "ARCX":
-            etfs.add(symbol)
-            finnhub_etfs += 1
-        elif sec_type in STOCK_TYPES or mic in {"XNYS", "XNAS", "BATS", "XASE"}:
-            stocks.add(symbol)
-            finnhub_stocks += 1
-
-    # Les ETF ne doivent pas être analysés comme actions
+    stocks = set(index_stocks) | nasdaq_stocks | set(WATCHLIST)
+    etfs = set(CORE_ETFS) | nasdaq_etfs
     stocks -= etfs
 
     stock_list = sorted(stocks)
     etf_list = sorted(etfs)
 
-    print(
-        f"🌍 Univers : {len(stock_list)} actions "
-        f"(indices: {len(index_stocks)}, Finnhub: +{finnhub_stocks}) | "
-        f"{len(etf_list)} ETF | {skipped_otc} symboles OTC ignorés"
+    log(
+        f"🌍 Univers total : {len(stock_list)} actions "
+        f"(indices Wikipedia: {len(index_stocks)}) | {len(etf_list)} ETF référencés"
     )
-    return stock_list, etf_list
+    return stock_list, etf_list, index_stocks
 
 
 def download_chunked(tickers, period="3mo"):
@@ -176,7 +351,7 @@ def download_chunked(tickers, period="3mo"):
         chunk = yahoo_tickers[i : i + CHUNK_SIZE]
         chunk_num = i // CHUNK_SIZE + 1
         total_chunks = (len(yahoo_tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
-        print(f"   Lot {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
+        log(f"   Lot {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
 
         try:
             data = yf.download(
@@ -266,10 +441,10 @@ def analyze_group(tickers, is_etf=False, spy_ret_20d=None):
         return pd.DataFrame()
 
     label = "ETF" if is_etf else "Actions"
-    print(f"📡 Analyse {label} : {len(tickers)} tickers (lots de {CHUNK_SIZE})...")
+    log(f"📡 Analyse {label} : {len(tickers)} tickers (lots de {CHUNK_SIZE})...")
 
     all_closes, all_volumes, ok, fail = download_chunked(tickers, period="3mo")
-    print(f"   ✅ {ok} récupérés | ❌ {fail} échecs")
+    log(f"   ✅ {ok} récupérés | ❌ {fail} échecs")
 
     results = []
     for ticker, c in all_closes.items():
@@ -424,7 +599,7 @@ def scan_unusual_options(df_stocks, df_etfs):
     if not candidates:
         return {}
 
-    print(f"🐳 Scan options UOA sur {len(candidates)} finalistes...")
+    log(f"🐳 Scan options UOA sur {len(candidates)} finalistes...")
     options_map = {}
     found = 0
 
@@ -434,12 +609,12 @@ def scan_unusual_options(df_stocks, df_etfs):
             options_map[ticker] = contracts
             found += 1
             top = contracts[0]
-            print(
+            log(
                 f"   {ticker}: {top['side']} {top['strike']} {short_expiry(top['expiry'])} "
                 f"Vol/OI {top['vol_oi']:.1f}x"
             )
 
-    print(f"   🐳 UOA détectée sur {found}/{len(candidates)} tickers")
+    log(f"   🐳 UOA détectée sur {found}/{len(candidates)} tickers")
     return options_map
 
 
@@ -489,30 +664,34 @@ def format_telegram(df_stocks, df_etfs, spy_ret_20d, options_map=None):
 
 
 def main():
-    if not all([FINNHUB_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-        raise Exception("Clés d'API ou Telegram manquantes. Vérifiez vos Secrets GitHub.")
+    if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+        raise Exception("Secrets Telegram manquants. Vérifiez vos Secrets GitHub.")
 
-    stocks, etfs = build_universe()
+    stock_list, etf_list, index_stocks = build_universe()
+    scan_stocks, scan_etfs, core_stocks = prepare_scan_universe(stock_list, etf_list, index_stocks)
 
     spy_ret_20d = get_spy_benchmark()
     if spy_ret_20d is not None:
-        print(f"📊 Benchmark SPY 20j : {spy_ret_20d:+.2f}%")
+        log(f"📊 Benchmark SPY 20j : {spy_ret_20d:+.2f}%")
 
-    df_stocks = analyze_group(stocks, is_etf=False, spy_ret_20d=spy_ret_20d)
-    df_etfs = analyze_group(etfs, is_etf=True, spy_ret_20d=spy_ret_20d)
+    df_stocks = analyze_group(scan_stocks, is_etf=False, spy_ret_20d=spy_ret_20d)
+    df_etfs = analyze_group(scan_etfs, is_etf=True, spy_ret_20d=spy_ret_20d)
 
-    # Vérification diagnostic : BHVN toujours dans l'univers
-    if "BHVN" in stocks:
+    if "BHVN" in core_stocks or "BHVN" in scan_stocks:
         in_results = "BHVN" in df_stocks["Ticker"].values if not df_stocks.empty else False
-        print(f"🔍 BHVN dans univers: oui | signal: {'oui' if in_results else 'non (pas de momentum actuel)'}")
+        in_core = "BHVN" in core_stocks
+        log(
+            f"🔍 BHVN — core: {'oui' if in_core else 'non'} | "
+            f"scan: oui | signal: {'oui' if in_results else 'non (pas de momentum actuel)'}"
+        )
 
     if not df_stocks.empty or not df_etfs.empty:
         options_map = scan_unusual_options(df_stocks, df_etfs)
         message = format_telegram(df_stocks, df_etfs, spy_ret_20d, options_map)
         send_telegram(message)
-        print("🚀 Alerte envoyée avec succès !")
+        log("🚀 Alerte envoyée avec succès !")
     else:
-        print("Calme plat. Aucune étoile montante détectée.")
+        log("Calme plat. Aucune étoile montante détectée.")
 
 
 if __name__ == "__main__":
