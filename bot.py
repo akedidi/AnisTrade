@@ -1,12 +1,34 @@
 import os
+import time
+import random
 import requests
 
-FMP_API_KEY = os.getenv("FMP_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TOP_ACTIONS = 10
 TOP_ETFS = 10
+MAX_SYMBOLS_TO_SCAN = 120
+
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+
+def finnhub_get(endpoint, params=None):
+    if params is None:
+        params = {}
+
+    params["token"] = FINNHUB_API_KEY
+    url = f"{FINNHUB_BASE}/{endpoint}"
+
+    r = requests.get(url, params=params, timeout=20)
+    print(endpoint, r.status_code)
+
+    if r.status_code != 200:
+        print(r.text[:500])
+        return None
+
+    return r.json()
 
 
 def send_telegram(message):
@@ -16,170 +38,180 @@ def send_telegram(message):
         url,
         json={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
+            "text": message,
+            "disable_web_page_preview": True
         },
         timeout=20
     )
 
     print("Telegram:", r.status_code)
-    print(r.text)
+    print(r.text[:500])
 
 
-def get_actions():
+def get_all_us_symbols():
+    data = finnhub_get("stock/symbol", {"exchange": "US"})
 
-    url = "https://financialmodelingprep.com/stable/company-screener"
+    if not isinstance(data, list):
+        return [], []
 
-    params = {
-        "isEtf": "false",
-        "isFund": "false",
-        "marketCapMoreThan": 300000000,
-        "marketCapLowerThan": 10000000000,
-        "priceLowerThan": 50,
-        "volumeMoreThan": 300000,
-        "isActivelyTrading": "true",
-        "limit": 100,
-        "apikey": FMP_API_KEY
-    }
+    actions = []
+    etfs = []
 
-    r = requests.get(url, params=params, timeout=30)
+    for item in data:
+        symbol = item.get("symbol")
+        description = item.get("description", "")
+        security_type = (item.get("type") or "").upper()
 
-    print("Actions status:", r.status_code)
+        if not symbol:
+            continue
 
-    r.raise_for_status()
+        if "." in symbol or "-" in symbol:
+            continue
 
-    return r.json()
+        if security_type == "ETF":
+            etfs.append({
+                "symbol": symbol,
+                "name": description
+            })
 
+        elif security_type in ["COMMON STOCK", "ADR", "REIT"]:
+            actions.append({
+                "symbol": symbol,
+                "name": description
+            })
 
-def get_etfs():
+    random.shuffle(actions)
+    random.shuffle(etfs)
 
-    url = "https://financialmodelingprep.com/stable/company-screener"
-
-    params = {
-        "isEtf": "true",
-        "isActivelyTrading": "true",
-        "volumeMoreThan": 10000,
-        "limit": 100,
-        "apikey": FMP_API_KEY
-    }
-
-    r = requests.get(url, params=params, timeout=30)
-
-    print("ETF status:", r.status_code)
-
-    r.raise_for_status()
-
-    return r.json()
+    return actions[:MAX_SYMBOLS_TO_SCAN], etfs[:MAX_SYMBOLS_TO_SCAN]
 
 
-def score_action(item):
+def get_quote(symbol):
+    return finnhub_get("quote", {"symbol": symbol})
+
+
+def score_item(symbol, name, quote, is_etf=False):
+    if not quote:
+        return None
+
+    current = quote.get("c") or 0
+    high = quote.get("h") or 0
+    low = quote.get("l") or 0
+    open_price = quote.get("o") or 0
+    previous_close = quote.get("pc") or 0
+
+    if current <= 0 or previous_close <= 0:
+        return None
+
+    daily_change = ((current - previous_close) / previous_close) * 100
+
+    intraday_range = 0
+    if low > 0:
+        intraday_range = ((high - low) / low) * 100
 
     score = 0
 
-    market_cap = item.get("marketCap") or 0
-    volume = item.get("volume") or 0
-    price = item.get("price") or 0
+    # Momentum positif mais pas délirant
+    if 0 < daily_change <= 8:
+        score += 45
+    elif 8 < daily_change <= 15:
+        score += 25
+    elif -3 <= daily_change <= 0:
+        score += 20
 
-    if market_cap < 1000000000:
-        score += 40
-    elif market_cap < 5000000000:
-        score += 30
-    else:
+    # Volatilité utile
+    if 2 <= intraday_range <= 12:
+        score += 25
+    elif 12 < intraday_range <= 20:
         score += 15
 
-    score += min(volume / 1000000, 1) * 40
+    # Prix accessible
+    if not is_etf:
+        if current < 10:
+            score += 20
+        elif current < 50:
+            score += 15
+        elif current < 100:
+            score += 5
+    else:
+        if 20 <= current <= 500:
+            score += 20
+        else:
+            score += 10
 
-    if price < 20:
-        score += 20
-    elif price < 50:
+    # Bonus ETF plus stable
+    if is_etf:
         score += 10
 
-    return round(score, 1)
+    return {
+        "symbol": symbol,
+        "name": name[:45],
+        "price": round(current, 2),
+        "change": round(daily_change, 2),
+        "range": round(intraday_range, 2),
+        "score": round(score, 1)
+    }
 
 
-def score_etf(item):
+def scan(items, is_etf=False):
+    results = []
 
-    score = 0
+    for item in items:
+        symbol = item["symbol"]
+        name = item["name"]
 
-    volume = item.get("volume") or 0
-    price = item.get("price") or 0
+        quote = get_quote(symbol)
+        scored = score_item(symbol, name, quote, is_etf=is_etf)
 
-    score += min(volume / 500000, 1) * 60
+        if scored:
+            results.append(scored)
 
-    if 20 <= price <= 300:
-        score += 40
-    else:
-        score += 20
+        time.sleep(1.1)  # respecte la limite gratuite Finnhub ~60 appels/min
 
-    return round(score, 1)
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    return results
+
+
+def format_section(title, items):
+    text = f"{title}\n\n"
+
+    if not items:
+        return text + "Aucun résultat.\n\n"
+
+    for i, item in enumerate(items, start=1):
+        text += (
+            f"{i}. {item['symbol']} - {item['name']}\n"
+            f"Prix: {item['price']}$ | Variation: {item['change']}%\n"
+            f"Range jour: {item['range']}% | Score: {item['score']}/100\n\n"
+        )
+
+    return text
 
 
 def main():
+    if not FINNHUB_API_KEY:
+        raise Exception("FINNHUB_API_KEY manquant")
+    if not TELEGRAM_TOKEN:
+        raise Exception("TELEGRAM_TOKEN manquant")
+    if not TELEGRAM_CHAT_ID:
+        raise Exception("TELEGRAM_CHAT_ID manquant")
 
-    if not FMP_API_KEY:
-        raise Exception("FMP_API_KEY manquant")
+    actions, etfs = get_all_us_symbols()
 
-    actions = get_actions()
-    etfs = get_etfs()
+    print("Actions à scanner:", len(actions))
+    print("ETF à scanner:", len(etfs))
 
-    scored_actions = []
+    scored_actions = scan(actions, is_etf=False)[:TOP_ACTIONS]
+    scored_etfs = scan(etfs, is_etf=True)[:TOP_ETFS]
 
-    for item in actions:
+    message = "🚀 AnisTrade - Scan générique Finnhub\n\n"
+    message += format_section("📈 ACTIONS", scored_actions)
+    message += format_section("📊 ETF", scored_etfs)
+    message += "⚠️ Signal indicatif, pas un conseil financier."
 
-        scored_actions.append({
-            "symbol": item.get("symbol"),
-            "name": item.get("companyName"),
-            "price": item.get("price"),
-            "volume": item.get("volume"),
-            "score": score_action(item)
-        })
-
-    scored_etfs = []
-
-    for item in etfs:
-
-        scored_etfs.append({
-            "symbol": item.get("symbol"),
-            "name": item.get("companyName"),
-            "price": item.get("price"),
-            "volume": item.get("volume"),
-            "score": score_etf(item)
-        })
-
-    scored_actions = sorted(
-        scored_actions,
-        key=lambda x: x["score"],
-        reverse=True
-    )[:TOP_ACTIONS]
-
-    scored_etfs = sorted(
-        scored_etfs,
-        key=lambda x: x["score"],
-        reverse=True
-    )[:TOP_ETFS]
-
-    message = "🚀 AnisTrade\n\n"
-
-    message += "📈 ACTIONS\n\n"
-
-    for i, item in enumerate(scored_actions, start=1):
-
-        message += (
-            f"{i}. {item['symbol']}\n"
-            f"Prix: {item['price']}$\n"
-            f"Score: {item['score']}\n\n"
-        )
-
-    message += "\n📊 ETF\n\n"
-
-    for i, item in enumerate(scored_etfs, start=1):
-
-        message += (
-            f"{i}. {item['symbol']}\n"
-            f"Prix: {item['price']}$\n"
-            f"Score: {item['score']}\n\n"
-        )
-
-    send_telegram(message)
+    # Telegram limite les messages à ~4096 caractères
+    send_telegram(message[:3900])
 
 
 if __name__ == "__main__":
