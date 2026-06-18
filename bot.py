@@ -3,7 +3,6 @@ import re
 import time
 import logging
 from datetime import datetime
-from io import StringIO
 import requests
 import warnings
 import pandas as pd
@@ -17,50 +16,50 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
-# otherlisted Exchange : N=NYSE, A=AMEX, P=ARCA, Z=BATS
 OTHER_EXCHANGES = {"N", "A", "P", "Z"}
 
 SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
+USER_AGENT = "AnisTradeBot/4.0 (rising-stars)"
 
-# ETF majeurs — toujours scannés (les milliers d'ETF NASDAQ ne sont pas tous téléchargés)
-CORE_ETFS = [
-    "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV", "VEA", "VWO", "AGG",
-    "BND", "TLT", "GLD", "SLV", "USO", "UNG", "XLK", "XLF", "XLE", "XLV",
-    "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "XLC", "XBI", "IBB", "ARKK",
-    "ARKG", "ARKW", "ARKF", "ARKQ", "SMH", "SOXX", "IGV", "HACK", "TAN",
-    "ICLN", "LIT", "GDX", "GDXJ", "XRT", "KRE", "KBE", "XHB", "ITB", "JETS",
-    "XOP", "OIH", "EWJ", "EWG", "EWZ", "FXI", "EEM", "EFA", "VUG", "VTV",
-    "SCHD", "VIG", "DVY", "HYG", "JNK", "LQD", "TIP", "SHY", "IEF", "RSP",
-    "MTUM", "QUAL", "USMV", "SPLV", "BOTZ", "ROBO", "CIBR", "SKYY", "FINX",
-    "XME", "PICK", "COPX", "REMX", "URA", "NLR", "XAR", "ITA", "PPA", "IYT",
-    "IYR", "VNQ", "SCHH", "REM", "MORT", "EMB", "VTEB", "MUB", "PFF", "PGX",
+US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "PCX", "BTS", "ASE"}
+
+# Screeners — priorité mid/small caps (pas most_actives en tête)
+RUNNER_SCREENERS = [
+    "small_cap_gainers",
+    "aggressive_small_caps",
+    "most_shorted_stocks",
+    "day_gainers",
 ]
+ALL_STOCK_SCREENERS = RUNNER_SCREENERS + ["most_actives"]
+SCREENER_COUNT = 250
+SCREENER_DELAY_SEC = 0.2
 
-CHUNK_SIZE = 100
+# Rising Stars — profil « peut encore doubler »
+RUNNER_MIN_PRICE = 2.0
+RUNNER_MAX_PRICE = 80.0
+RUNNER_MAX_MARKET_CAP = 10_000_000_000
+RUNNER_MIN_VAR20 = 15.0
+RUNNER_MAX_VAR20 = 60.0
+RUNNER_MIN_VOL_RATIO = 1.2
+RUNNER_MAX_DOWNLOAD = 120
+RUNNER_TOP_ALERTS = 10
+EXTENDED_TOP_ALERTS = 5
+
+CHUNK_SIZE = 80
 CHUNK_DELAY_SEC = 0.25
 
-# Univers scan — core toujours inclus, extended filtré par liquidité
-WATCHLIST = ["BHVN"]  # mid-caps à toujours inclure
-MIN_AVG_VOLUME = 400_000
-MIN_PRICE = 2.0
-MAX_EXTENDED_LIQUID = 1500
-PREFILTER_PERIOD = "5d"
-USE_EXTENDED_LIQUID_SCAN = False  # True = +1500 mid-caps (plus lent, ~15 min)
-
-# Options — scan uniquement sur les finalistes momentum
+# Options — CALL OTM bullish uniquement sur les runners
 OPTIONS_MAX_EXPIRATIONS = 2
 OPTIONS_MIN_VOL_OI = 2.0
+OPTIONS_MIN_OI = 10
 OPTIONS_MIN_VOLUME_STOCK = 100
-OPTIONS_MIN_VOLUME_ETF = 500
+OPTIONS_OTM_MIN_PCT = 1.02
 OPTIONS_DELAY_SEC = 0.25
+OPTIONS_CONTRACTS_PER_TICKER = 2
 
 
 def to_yahoo_symbol(symbol: str) -> str:
     return symbol.replace(".", "-")
-
-
-def from_yahoo_symbol(symbol: str) -> str:
-    return symbol.replace("-", ".")
 
 
 def log(msg):
@@ -84,32 +83,8 @@ def send_telegram(message):
         print(f"Erreur Telegram: {e}")
 
 
-def fetch_index_tickers():
-    """Indices de référence via Wikipedia — 0 appel API payant, toujours liquides."""
-    stocks = set()
-    headers = {"User-Agent": "AnisTradeBot/2.0 (momentum-scanner)"}
-    for url, col in [
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
-        ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker"),
-    ]:
-        try:
-            r = requests.get(url, headers=headers, timeout=20)
-            r.raise_for_status()
-            tables = pd.read_html(StringIO(r.text))
-            for table in tables:
-                if col in table.columns:
-                    for sym in table[col].dropna().astype(str):
-                        sym = sym.strip().upper()
-                        if SYMBOL_RE.match(sym):
-                            stocks.add(sym)
-                    break
-        except Exception as e:
-            print(f"⚠️ Wikipedia ({url}): {e}")
-    return stocks
-
-
 def fetch_nasdaq_trader_file(url):
-    headers = {"User-Agent": "AnisTradeBot/2.0 (momentum-scanner)"}
+    headers = {"User-Agent": USER_AGENT}
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.text
@@ -147,7 +122,6 @@ def _parse_other_row(row, stocks, etfs, stats_key):
 
 
 def fetch_nasdaq_trader_symbols():
-    """Annuaire officiel US — 2 fichiers TXT gratuits, mis à jour chaque nuit."""
     log("📥 Téléchargement annuaire NASDAQ Trader (2 fichiers)...")
     stocks = set()
     etfs = set()
@@ -162,11 +136,7 @@ def fetch_nasdaq_trader_symbols():
             if len(parts) < 8:
                 continue
             _parse_nasdaq_row(
-                {
-                    "Symbol": parts[0],
-                    "Test Issue": parts[3],
-                    "ETF": parts[6],
-                },
+                {"Symbol": parts[0], "Test Issue": parts[3], "ETF": parts[6]},
                 stocks,
                 etfs,
                 stats,
@@ -194,164 +164,130 @@ def fetch_nasdaq_trader_symbols():
         log(f"⚠️ Erreur NASDAQ Trader: {e}")
         return set(), set()
 
-    log(
-        f"   NASDAQ Trader : {len(stocks)} actions, {len(etfs)} ETF "
-        f"(brut {stats['stocks']}+{stats['etfs']}, exchanges ignorés: {stats['skipped_exchange']})"
-    )
+    log(f"   NASDAQ Trader : {len(stocks)} actions, {len(etfs)} ETF")
     return stocks, etfs
 
 
-def filter_liquid_tickers(tickers):
-    """Pré-filtre rapide 5j — s'arrête dès que MAX_EXTENDED_LIQUID titres liquides trouvés."""
-    if not tickers:
-        return []
+def _quote_context(quote):
+    return {
+        "change_pct": quote.get("regularMarketChangePercent"),
+        "price": quote.get("regularMarketPrice") or quote.get("intradayprice"),
+        "volume": quote.get("regularMarketVolume") or quote.get("dayvolume"),
+        "market_cap": quote.get("marketCap"),
+    }
 
-    yahoo_tickers = [to_yahoo_symbol(t) for t in tickers]
-    yahoo_to_orig = {to_yahoo_symbol(t): t for t in tickers}
-    total_chunks = (len(yahoo_tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    log(
-        f"   Pré-filtre liquidité ({PREFILTER_PERIOD}) sur {len(tickers)} tickers "
-        f"(early-stop à {MAX_EXTENDED_LIQUID})..."
-    )
+def _extract_screener_quotes(quotes, quote_type="EQUITY"):
+    by_symbol = {}
+    for q in quotes or []:
+        if q.get("quoteType") != quote_type:
+            continue
+        if q.get("exchange") not in US_EXCHANGES:
+            continue
+        sym = q.get("symbol", "").upper().strip()
+        if not SYMBOL_RE.match(sym):
+            continue
+        by_symbol[sym] = _quote_context(q)
+    return by_symbol
 
-    candidates = []
-    ok, fail = 0, 0
 
-    for i in range(0, len(yahoo_tickers), CHUNK_SIZE):
-        chunk = yahoo_tickers[i : i + CHUNK_SIZE]
-        chunk_num = i // CHUNK_SIZE + 1
-        log(f"   Pré-filtre lot {chunk_num}/{total_chunks}...")
+def fetch_screener_universe():
+    log("📡 Screeners Yahoo (rising stars)...")
+    stock_quotes = {}
+    sources = {
+        "small_cap": set(),
+        "aggressive": set(),
+        "shorted": set(),
+        "gainers": set(),
+        "actives": set(),
+    }
 
+    for name in ALL_STOCK_SCREENERS:
         try:
-            data = yf.download(
-                chunk,
-                period=PREFILTER_PERIOD,
-                progress=False,
-                ignore_tz=True,
-                threads=False,
-                auto_adjust=True,
-            )
-        except Exception:
-            fail += len(chunk)
-            time.sleep(CHUNK_DELAY_SEC)
+            resp = yf.screen(name, count=SCREENER_COUNT)
+            quotes = resp.get("quotes", []) if isinstance(resp, dict) else []
+            found = _extract_screener_quotes(quotes, "EQUITY")
+            log(f"   {name}: {len(found)} actions")
+            stock_quotes.update(found)
+            key = {
+                "small_cap_gainers": "small_cap",
+                "aggressive_small_caps": "aggressive",
+                "most_shorted_stocks": "shorted",
+                "day_gainers": "gainers",
+                "most_actives": "actives",
+            }.get(name)
+            if key:
+                sources[key] |= set(found.keys())
+        except Exception as e:
+            log(f"   ⚠️ {name}: {e}")
+        time.sleep(SCREENER_DELAY_SEC)
+
+    log(f"   Total screener : {len(stock_quotes)} actions uniques")
+    return stock_quotes, sources
+
+
+def _screener_priority(sym, sources):
+    score = 0
+    if sym in sources["shorted"]:
+        score += 4
+    if sym in sources["small_cap"]:
+        score += 3
+    if sym in sources["aggressive"]:
+        score += 3
+    if sym in sources["gainers"]:
+        score += 1
+    if sym in sources["actives"]:
+        score += 0
+    return score
+
+
+def _passes_screener_prefilter(ctx, sym, sources):
+    price = ctx.get("price")
+    cap = ctx.get("market_cap")
+    if price is None or price < RUNNER_MIN_PRICE or price > RUNNER_MAX_PRICE:
+        return False
+    if cap is not None and cap > RUNNER_MAX_MARKET_CAP:
+        return False
+    if _screener_priority(sym, sources) == 0 and sym not in sources["actives"]:
+        return False
+    return True
+
+
+def build_runner_candidates(stock_quotes, nasdaq_stocks, sources):
+    """Mid/small caps des screeners — pas les mega-caps most_actives."""
+    candidates = []
+    for sym, ctx in stock_quotes.items():
+        if sym not in nasdaq_stocks:
             continue
-
-        if data is None or data.empty or "Close" not in data:
-            fail += len(chunk)
-            time.sleep(CHUNK_DELAY_SEC)
+        if not _passes_screener_prefilter(ctx, sym, sources):
             continue
+        priority = _screener_priority(sym, sources)
+        vol = ctx.get("volume") or 0
+        candidates.append((sym, priority, vol, ctx))
 
-        closes = data["Close"]
-        volumes = data["Volume"]
-
-        def process_series(yt, c_series, v_series):
-            nonlocal ok, fail
-            orig = yahoo_to_orig.get(yt, yt)
-            try:
-                c = c_series.dropna()
-                v = v_series.dropna()
-                if len(c) < 2 or len(v) < 2:
-                    fail += 1
-                    return
-                price = float(c.iloc[-1])
-                avg_vol = float(v.mean())
-                if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
-                    candidates.append((orig, avg_vol))
-                ok += 1
-            except Exception:
-                fail += 1
-
-        if isinstance(closes, pd.Series):
-            process_series(chunk[0], closes, volumes)
-        else:
-            for yt in chunk:
-                if yt not in closes.columns:
-                    fail += 1
-                    continue
-                process_series(yt, closes[yt], volumes[yt])
-
-        if len(candidates) >= MAX_EXTENDED_LIQUID:
-            log(f"   Early-stop pré-filtre lot {chunk_num}/{total_chunks} ({len(candidates)} liquides)")
-            break
-
-        time.sleep(CHUNK_DELAY_SEC)
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    selected = [t for t, _ in candidates[:MAX_EXTENDED_LIQUID]]
-    log(f"   Pré-filtre : {len(selected)} retenus | {ok} ok | {fail} échecs")
-    return selected
-
-
-def prepare_scan_universe(stock_list, etf_list, index_stocks):
-    """
-    Core (indices + watchlist) toujours scanné.
-    Extended : actions hors core, filtrées par liquidité.
-    ETF : CORE_ETFS uniquement (pas les milliers d'ETF du fichier NASDAQ).
-    """
-    all_stocks = set(stock_list)
-    core = (set(index_stocks) | set(WATCHLIST)) & all_stocks
-    for sym in WATCHLIST:
-        if sym.upper() not in all_stocks:
-            log(f"   ⚠️ WATCHLIST {sym} absent de l'annuaire NASDAQ")
-
-    extended = sorted(all_stocks - core)
-    if USE_EXTENDED_LIQUID_SCAN and extended:
-        liquid_extended = filter_liquid_tickers(extended)
-    else:
-        liquid_extended = []
-        if extended and not USE_EXTENDED_LIQUID_SCAN:
-            log(f"   Extended désactivé ({len(extended)} actions hors core ignorées)")
-    scan_stocks = sorted(core | set(liquid_extended))
-
-    scan_etfs = sorted(set(CORE_ETFS))
-
+    candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    selected = [sym for sym, _, _, _ in candidates[:RUNNER_MAX_DOWNLOAD]]
     log(
-        f"🎯 Scan cible : {len(scan_stocks)} actions "
-        f"(core {len(core)} + liquidité {len(liquid_extended)}) | "
-        f"{len(scan_etfs)} ETF"
+        f"🎯 Cibles Rising Stars : {len(selected)} actions "
+        f"(prix {RUNNER_MIN_PRICE}-{RUNNER_MAX_PRICE}$, cap <{RUNNER_MAX_MARKET_CAP // 1_000_000_000}Md$)"
     )
-    return scan_stocks, scan_etfs, core
-
-
-def build_universe():
-    """
-    Univers via NASDAQ Trader (2 fichiers) + indices Wikipedia.
-    """
-    index_stocks = fetch_index_tickers()
-    nasdaq_stocks, nasdaq_etfs = fetch_nasdaq_trader_symbols()
-
-    stocks = set(index_stocks) | nasdaq_stocks | set(WATCHLIST)
-    etfs = set(CORE_ETFS) | nasdaq_etfs
-    stocks -= etfs
-
-    stock_list = sorted(stocks)
-    etf_list = sorted(etfs)
-
-    log(
-        f"🌍 Univers total : {len(stock_list)} actions "
-        f"(indices Wikipedia: {len(index_stocks)}) | {len(etf_list)} ETF référencés"
-    )
-    return stock_list, etf_list, index_stocks
+    return selected, {sym: ctx for sym, _, _, ctx in candidates}
 
 
 def download_chunked(tickers, period="3mo"):
-    """Téléchargement par lots — plus fiable que 800 tickers d'un coup."""
     if not tickers:
-        return pd.DataFrame(), pd.DataFrame(), 0, 0
+        return {}, {}, 0, 0
 
     yahoo_tickers = [to_yahoo_symbol(t) for t in tickers]
     yahoo_to_orig = {to_yahoo_symbol(t): t for t in tickers}
-
-    all_closes = {}
-    all_volumes = {}
+    all_closes, all_volumes = {}, {}
     ok, fail = 0, 0
 
     for i in range(0, len(yahoo_tickers), CHUNK_SIZE):
         chunk = yahoo_tickers[i : i + CHUNK_SIZE]
         chunk_num = i // CHUNK_SIZE + 1
-        total_chunks = (len(yahoo_tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
-        log(f"   Lot {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
+        total = (len(yahoo_tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        log(f"   Lot {chunk_num}/{total} ({len(chunk)} tickers)...")
 
         try:
             data = yf.download(
@@ -372,12 +308,10 @@ def download_chunked(tickers, period="3mo"):
             time.sleep(CHUNK_DELAY_SEC)
             continue
 
-        closes = data["Close"]
-        volumes = data["Volume"]
-
+        closes, volumes = data["Close"], data["Volume"]
         if isinstance(closes, pd.Series):
             orig = yahoo_to_orig.get(chunk[0], chunk[0])
-            if closes.dropna().shape[0] >= 2:
+            if closes.dropna().shape[0] >= 22:
                 all_closes[orig] = closes
                 all_volumes[orig] = volumes
                 ok += 1
@@ -390,8 +324,7 @@ def download_chunked(tickers, period="3mo"):
                     fail += 1
                     continue
                 c = closes[yt].dropna()
-                v = volumes[yt].dropna()
-                if len(c) >= 2 and len(v) >= 2:
+                if len(c) >= 22:
                     all_closes[orig] = closes[yt]
                     all_volumes[orig] = volumes[yt]
                     ok += 1
@@ -412,20 +345,22 @@ def pct_return(series, days):
     return (float(series.iloc[-1]) / base - 1) * 100
 
 
-def momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, above_sma20):
+def runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating):
     score = 0.0
-    if var_1d is not None and var_1d > 0:
-        score += min(var_1d * 2, 20)
     if var_5d is not None and var_5d > 0:
-        score += min(var_5d, 25)
-    if var_20d is not None and var_20d > 0:
-        score += min(var_20d * 0.8, 30)
+        score += min(var_5d * 1.2, 25)
+    if var_20d is not None and RUNNER_MIN_VAR20 <= var_20d <= RUNNER_MAX_VAR20:
+        score += min(var_20d * 0.9, 35)
+    if var_1d is not None and var_1d > 0:
+        score += min(var_1d * 1.5, 15)
     if rs_20d is not None and rs_20d > 0:
-        score += min(rs_20d * 0.6, 20)
-    if vol_ratio is not None and vol_ratio > 1:
-        score += min((vol_ratio - 1) * 5, 10)
-    if above_sma20:
-        score += 5
+        score += min(rs_20d * 0.5, 15)
+    if vol_ratio is not None and vol_ratio >= RUNNER_MIN_VOL_RATIO:
+        score += min((vol_ratio - 1) * 8, 15)
+    if is_shorted:
+        score += 8
+    if accelerating:
+        score += 10
     return round(min(score, 100), 1)
 
 
@@ -436,81 +371,77 @@ def get_spy_benchmark():
     return pct_return(closes["SPY"], 20)
 
 
-def analyze_group(tickers, is_etf=False, spy_ret_20d=None):
-    if not tickers:
-        return pd.DataFrame()
-
-    label = "ETF" if is_etf else "Actions"
-    log(f"📡 Analyse {label} : {len(tickers)} tickers (lots de {CHUNK_SIZE})...")
-
+def analyze_runners(tickers, sources, spy_ret_20d):
+    log(f"📡 Analyse momentum {len(tickers)} tickers...")
     all_closes, all_volumes, ok, fail = download_chunked(tickers, period="3mo")
     log(f"   ✅ {ok} récupérés | ❌ {fail} échecs")
 
-    results = []
-    for ticker, c in all_closes.items():
-        try:
-            v = all_volumes.get(ticker)
-            if v is None:
-                continue
-
-            c = c.dropna()
-            v = v.dropna()
-            if len(c) < 22 or len(v) < 6:
-                continue
-
-            price = float(c.iloc[-1])
-            var_1d = pct_return(c, 1)
-            var_5d = pct_return(c, 5)
-            var_20d = pct_return(c, 20)
-
-            prior_vol = v.iloc[:-1]
-            avg_vol = float(prior_vol.tail(20).mean()) if len(prior_vol) >= 5 else float(prior_vol.mean())
-            today_vol = float(v.iloc[-1])
-            vol_ratio = today_vol / avg_vol if avg_vol > 0 else 0
-
-            sma20 = float(c.tail(20).mean())
-            above_sma20 = price > sma20
-
-            rs_20d = (var_20d - spy_ret_20d) if (var_20d is not None and spy_ret_20d is not None) else None
-            score = momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, above_sma20)
-
-            if is_etf:
-                passes = (
-                    score >= 40
-                    and var_20d is not None
-                    and var_20d >= 3
-                    and var_1d is not None
-                    and var_1d >= 1.5
-                )
-            else:
-                passes = (
-                    score >= 50
-                    and price >= 2.0
-                    and var_20d is not None
-                    and var_20d >= 5
-                    and (rs_20d is None or rs_20d >= 0)
-                )
-
-            if passes:
-                results.append(
-                    {
-                        "Ticker": ticker,
-                        "Score": score,
-                        "Prix": price,
-                        "Var1j": var_1d or 0,
-                        "Var5j": var_5d or 0,
-                        "Var20j": var_20d or 0,
-                        "RS20j": rs_20d or 0,
-                        "VolRatio": vol_ratio,
-                    }
-                )
-        except Exception:
+    runners, extended = [], []
+    for ticker in tickers:
+        c = all_closes.get(ticker)
+        v = all_volumes.get(ticker)
+        if c is None or v is None:
             continue
 
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values(by=["Score", "Var20j"], ascending=False)
-    return df
+        c, v = c.dropna(), v.dropna()
+        if len(c) < 22 or len(v) < 6:
+            continue
+
+        price = float(c.iloc[-1])
+        var_1d = pct_return(c, 1)
+        var_5d = pct_return(c, 5)
+        var_20d = pct_return(c, 20)
+
+        prior_vol = v.iloc[:-1]
+        avg_vol = float(prior_vol.tail(20).mean()) if len(prior_vol) >= 5 else float(prior_vol.mean())
+        vol_ratio = float(v.iloc[-1]) / avg_vol if avg_vol > 0 else 0
+
+        rs_20d = (var_20d - spy_ret_20d) if (var_20d is not None and spy_ret_20d is not None) else None
+        is_shorted = ticker in sources["shorted"]
+        accelerating = (
+            var_5d is not None
+            and var_20d is not None
+            and var_5d > 0
+            and var_5d > (var_20d / 4)
+        )
+
+        row = {
+            "Ticker": ticker,
+            "Prix": price,
+            "Var1j": var_1d or 0,
+            "Var5j": var_5d or 0,
+            "Var20j": var_20d or 0,
+            "RS20j": rs_20d or 0,
+            "VolRatio": vol_ratio,
+            "Shorted": is_shorted,
+        }
+
+        if price < RUNNER_MIN_PRICE or price > RUNNER_MAX_PRICE:
+            continue
+
+        if var_20d is not None and var_20d > RUNNER_MAX_VAR20:
+            row["Score"] = runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating)
+            extended.append(row)
+            continue
+
+        is_runner = (
+            var_20d is not None
+            and RUNNER_MIN_VAR20 <= var_20d <= RUNNER_MAX_VAR20
+            and vol_ratio >= RUNNER_MIN_VOL_RATIO
+            and (rs_20d is None or rs_20d >= 0)
+        )
+        if is_runner:
+            row["Score"] = runner_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating)
+            runners.append(row)
+
+    df_runners = pd.DataFrame(runners)
+    df_extended = pd.DataFrame(extended)
+    if not df_runners.empty:
+        df_runners = df_runners.sort_values(by=["Score", "Var20j"], ascending=False)
+    if not df_extended.empty:
+        df_extended = df_extended.sort_values(by="Var20j", ascending=False)
+    log(f"   🌟 {len(df_runners)} runners | 📈 {len(df_extended)} déjà étirés (> {RUNNER_MAX_VAR20}% 20j)")
+    return df_runners, df_extended
 
 
 def short_expiry(exp_str):
@@ -520,11 +451,12 @@ def short_expiry(exp_str):
         return exp_str
 
 
-def _uoa_from_chain(df, side, expiry, min_volume):
-    """Extrait les contrats avec volume > OI et Vol/OI >= seuil."""
-    if df is None or df.empty:
+def _uoa_calls_otm(df, expiry, spot_price, min_volume):
+    """CALL OTM uniquement — pari haussier directionnel."""
+    if df is None or df.empty or spot_price is None:
         return []
 
+    min_strike = spot_price * OPTIONS_OTM_MIN_PCT
     hits = []
     for row in df.itertuples(index=False):
         vol = getattr(row, "volume", None)
@@ -535,30 +467,33 @@ def _uoa_from_chain(df, side, expiry, min_volume):
         if pd.isna(vol) or pd.isna(oi) or pd.isna(strike):
             continue
 
-        vol = int(vol)
-        oi = int(oi)
-        if vol < min_volume or oi <= 0 or vol <= oi:
+        strike = float(strike)
+        if strike < min_strike:
             continue
 
+        vol, oi = int(vol), int(oi)
+        if vol < min_volume or oi < OPTIONS_MIN_OI or vol <= oi:
+            continue
         vol_oi = vol / oi
         if vol_oi < OPTIONS_MIN_VOL_OI:
             continue
 
+        otm_pct = (strike / spot_price - 1) * 100
         hits.append(
             {
-                "side": side,
-                "strike": float(strike),
+                "side": "CALL",
+                "strike": strike,
                 "expiry": expiry,
                 "volume": vol,
                 "oi": oi,
                 "vol_oi": round(vol_oi, 1),
+                "otm_pct": round(otm_pct, 1),
             }
         )
     return hits
 
 
-def scan_ticker_options(ticker, is_etf=False):
-    """Scan UOA (Vol > OI) sur 2 échéances proches — 1 ticker à la fois."""
+def scan_runner_options(ticker, spot_price):
     try:
         tk = yf.Ticker(to_yahoo_symbol(ticker))
         expirations = tk.options
@@ -567,99 +502,89 @@ def scan_ticker_options(ticker, is_etf=False):
     except Exception:
         return []
 
-    min_volume = OPTIONS_MIN_VOLUME_ETF if is_etf else OPTIONS_MIN_VOLUME_STOCK
     hits = []
-
     for exp in expirations[:OPTIONS_MAX_EXPIRATIONS]:
         try:
             chain = tk.option_chain(exp)
-            hits.extend(_uoa_from_chain(chain.calls, "CALL", exp, min_volume))
-            hits.extend(_uoa_from_chain(chain.puts, "PUT", exp, min_volume))
+            hits.extend(_uoa_calls_otm(chain.calls, exp, spot_price, OPTIONS_MIN_VOLUME_STOCK))
         except Exception:
             pass
         time.sleep(OPTIONS_DELAY_SEC)
 
     hits.sort(key=lambda x: x["vol_oi"], reverse=True)
-    return hits[:1]
+    return hits[:OPTIONS_CONTRACTS_PER_TICKER]
 
 
-def scan_unusual_options(df_stocks, df_etfs):
-    """
-    Deuxième passe options sur les finalistes momentum seulement.
-    ~15 tickers × 2 échéances ≈ 30 requêtes Yahoo.
-    """
-    candidates = []
-    if not df_stocks.empty:
-        for _, row in df_stocks.head(10).iterrows():
-            candidates.append((row["Ticker"], False))
-    if not df_etfs.empty:
-        for _, row in df_etfs.head(5).iterrows():
-            candidates.append((row["Ticker"], True))
-
-    if not candidates:
+def scan_runners_uoa(df_runners):
+    if df_runners.empty:
         return {}
 
-    log(f"🐳 Scan options UOA sur {len(candidates)} finalistes...")
+    log(f"🐳 Scan CALL OTM sur {min(len(df_runners), RUNNER_TOP_ALERTS)} runners...")
     options_map = {}
-    found = 0
-
-    for ticker, is_etf in candidates:
-        contracts = scan_ticker_options(ticker, is_etf=is_etf)
+    for _, row in df_runners.head(RUNNER_TOP_ALERTS).iterrows():
+        ticker = row["Ticker"]
+        contracts = scan_runner_options(ticker, row["Prix"])
         if contracts:
             options_map[ticker] = contracts
-            found += 1
             top = contracts[0]
             log(
-                f"   {ticker}: {top['side']} {top['strike']} {short_expiry(top['expiry'])} "
+                f"   {ticker}: CALL {top['strike']} OTM +{top['otm_pct']}% "
                 f"Vol/OI {top['vol_oi']:.1f}x"
             )
-
-    log(f"   🐳 UOA détectée sur {found}/{len(candidates)} tickers")
+    log(f"   🐳 UOA bullish : {len(options_map)}/{min(len(df_runners), RUNNER_TOP_ALERTS)} runners")
     return options_map
 
 
-def format_options_line(ticker, options_map):
-    contracts = options_map.get(ticker)
-    if not contracts:
-        return ""
-    c = contracts[0]
-    return (
-        f"   🐳 {c['side']} {c['strike']:.1f} {short_expiry(c['expiry'])} | "
-        f"Vol:{c['volume']:,} > OI:{c['oi']:,} | {c['vol_oi']:.1f}x\n"
+def _format_runner_line(row, options_map):
+    line = (
+        f"*{row['Ticker']}* Score:{row['Score']:.0f} | "
+        f"{row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | 20j:{row['Var20j']:+.1f}% | "
+        f"Vol:{row['VolRatio']:.1f}x | {row['Prix']:.2f}$"
+    )
+    if row.get("Shorted"):
+        line += " | _short_"
+    line += "\n"
+
+    contracts = options_map.get(row["Ticker"])
+    if contracts:
+        c = contracts[0]
+        line += (
+            f"   🐳 CALL {c['strike']:.1f} OTM +{c['otm_pct']:.0f}% {short_expiry(c['expiry'])} | "
+            f"Vol:{c['volume']:,} > OI:{c['oi']:,} | {c['vol_oi']:.1f}x\n"
+        )
+    return line
+
+
+def format_rising_stars_telegram(df_runners, df_extended, spy_ret_20d, options_map):
+    spy_line = f"SPY 20j: {spy_ret_20d:+.1f}%" if spy_ret_20d is not None else ""
+    message = (
+        f"🚀 *AnisTrade — RISING STARS*\n"
+        f"_{spy_line} | Prix {RUNNER_MIN_PRICE:.0f}-{RUNNER_MAX_PRICE:.0f}$ | "
+        f"Cap <{RUNNER_MAX_MARKET_CAP // 1_000_000_000}Md$ | "
+        f"20j: {RUNNER_MIN_VAR20:.0f}-{RUNNER_MAX_VAR20:.0f}% | Vol≥{RUNNER_MIN_VOL_RATIO}x_\n\n"
     )
 
+    if not df_runners.empty:
+        message += "🌟 *RUNNERS POTENTIELS* _(marge de doubler)_\n"
+        for _, row in df_runners.head(RUNNER_TOP_ALERTS).iterrows():
+            message += _format_runner_line(row, options_map)
+        message += "\n"
+    else:
+        message += "🌟 _Aucun runner ne passe les filtres aujourd'hui._\n\n"
 
-def format_telegram(df_stocks, df_etfs, spy_ret_20d, options_map=None):
-    spy_line = f"SPY 20j: {spy_ret_20d:+.1f}%" if spy_ret_20d is not None else ""
-    message = f"🚀 *AnisTrade — MOMENTUM + OPTIONS*\n_{spy_line}_\n\n"
-    options_map = options_map or {}
-
-    if not df_stocks.empty:
-        message += "📈 *ACTIONS*\n"
-        for _, row in df_stocks.head(10).iterrows():
+    if not df_extended.empty:
+        message += f"📈 *DÉJÀ EN RUN* _(>{RUNNER_MAX_VAR20:.0f}% sur 20j — continuation, pas ×2)_\n"
+        for _, row in df_extended.head(EXTENDED_TOP_ALERTS).iterrows():
             message += (
-                f"🔥 *{row['Ticker']}* Score:{row['Score']:.0f} | "
-                f"+{row['Var1j']:.1f}% | 5j:{row['Var5j']:+.1f}% | 20j:{row['Var20j']:+.1f}% | "
-                f"RS:{row['RS20j']:+.1f}% | Vol:{row['VolRatio']:.1f}x | {row['Prix']:.2f}$\n"
+                f"_{row['Ticker']}_ {row['Var20j']:+.0f}% 20j | {row['Prix']:.0f}$ "
+                f"| Vol:{row['VolRatio']:.1f}x\n"
             )
-            message += format_options_line(row["Ticker"], options_map)
         message += "\n"
 
-    if not df_etfs.empty:
-        message += "📊 *ETF*\n"
-        for _, row in df_etfs.head(5).iterrows():
-            message += (
-                f"⚡ *{row['Ticker']}* Score:{row['Score']:.0f} | "
-                f"+{row['Var1j']:.1f}% | 5j:{row['Var5j']:+.1f}% | 20j:{row['Var20j']:+.1f}% | "
-                f"Vol:{row['VolRatio']:.1f}x | {row['Prix']:.2f}$\n"
-            )
-            message += format_options_line(row["Ticker"], options_map)
-        message += "\n"
-
-    uoa_count = len(options_map)
-    if uoa_count:
-        message += f"🐳 _{uoa_count} ticker(s) avec activité options inhabituelle (Vol > OI, ratio ≥ {OPTIONS_MIN_VOL_OI}x)_\n"
-    message += "⚠️ _Vérifiez catalyseurs et contexte avant trade._"
+    uoa_n = len(options_map)
+    if uoa_n:
+        message += f"🐳 _{uoa_n} runner(s) avec CALL OTM inhabituel (Vol > OI, ratio ≥ {OPTIONS_MIN_VOL_OI}x)_\n"
+    message += "⚠️ _Pas de garantie +100%. Vérifiez catalyseurs (earnings, FDA, short squeeze)._"
     return message
 
 
@@ -667,29 +592,25 @@ def main():
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         raise Exception("Secrets Telegram manquants. Vérifiez vos Secrets GitHub.")
 
-    stock_list, etf_list, index_stocks = build_universe()
-    scan_stocks, scan_etfs, core_stocks = prepare_scan_universe(stock_list, etf_list, index_stocks)
+    nasdaq_stocks, _ = fetch_nasdaq_trader_symbols()
+    stock_quotes, sources = fetch_screener_universe()
+    tickers, _ = build_runner_candidates(stock_quotes, nasdaq_stocks, sources)
+
+    if not tickers:
+        log("Aucun candidat screener. Fin.")
+        return
 
     spy_ret_20d = get_spy_benchmark()
     if spy_ret_20d is not None:
         log(f"📊 Benchmark SPY 20j : {spy_ret_20d:+.2f}%")
 
-    df_stocks = analyze_group(scan_stocks, is_etf=False, spy_ret_20d=spy_ret_20d)
-    df_etfs = analyze_group(scan_etfs, is_etf=True, spy_ret_20d=spy_ret_20d)
+    df_runners, df_extended = analyze_runners(tickers, sources, spy_ret_20d)
+    options_map = scan_runners_uoa(df_runners)
 
-    if "BHVN" in core_stocks or "BHVN" in scan_stocks:
-        in_results = "BHVN" in df_stocks["Ticker"].values if not df_stocks.empty else False
-        in_core = "BHVN" in core_stocks
-        log(
-            f"🔍 BHVN — core: {'oui' if in_core else 'non'} | "
-            f"scan: oui | signal: {'oui' if in_results else 'non (pas de momentum actuel)'}"
-        )
-
-    if not df_stocks.empty or not df_etfs.empty:
-        options_map = scan_unusual_options(df_stocks, df_etfs)
-        message = format_telegram(df_stocks, df_etfs, spy_ret_20d, options_map)
+    if not df_runners.empty or not df_extended.empty:
+        message = format_rising_stars_telegram(df_runners, df_extended, spy_ret_20d, options_map)
         send_telegram(message)
-        log("🚀 Alerte envoyée avec succès !")
+        log("🚀 Alerte Rising Stars envoyée !")
     else:
         log("Calme plat. Aucune étoile montante détectée.")
 
