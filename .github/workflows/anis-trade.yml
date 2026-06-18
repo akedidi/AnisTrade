@@ -1,11 +1,7 @@
 name: AnisTrade
 
 on:
-  workflow_dispatch: # Permet toujours le déclenchement manuel depuis l'interface GitHub
-  schedule:
-    # S'exécute à 14:00 UTC (soit 16h00 heure de Paris), du lundi au vendredi
-    # Wall Street ouvre à 15h30 (heure de Paris), cela laisse 30 minutes au marché pour générer du volume
-    - cron: '0 14 * * 1-5'
+  workflow_dispatch: # C'est cette ligne unique qui maintient le bouton manuel actif
 
 jobs:
   run-bot:
