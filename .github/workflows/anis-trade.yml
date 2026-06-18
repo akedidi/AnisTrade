@@ -1,14 +1,18 @@
 name: AnisTrade
 
 on:
-  workflow_dispatch
+  workflow_dispatch: # Permet toujours le déclenchement manuel depuis l'interface GitHub
+  schedule:
+    # S'exécute à 14:00 UTC (soit 16h00 heure de Paris), du lundi au vendredi
+    # Wall Street ouvre à 15h30 (heure de Paris), cela laisse 30 minutes au marché pour générer du volume
+    - cron: '0 14 * * 1-5'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -21,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run AnisTrade
+      - name: Run AnisTrade Bot
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
