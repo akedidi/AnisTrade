@@ -5,55 +5,168 @@ FMP_API_KEY = os.getenv("FMP_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-print("=== DEBUG ===")
-print("FMP_API_KEY:", "OK" if FMP_API_KEY else "MISSING")
-print("TELEGRAM_TOKEN:", "OK" if TELEGRAM_TOKEN else "MISSING")
-print("TELEGRAM_CHAT_ID:", "OK" if TELEGRAM_CHAT_ID else "MISSING")
-print("=============")
+TOP_N = 10
 
-if not FMP_API_KEY:
-    raise Exception("FMP_API_KEY manquant")
 
-if not TELEGRAM_TOKEN:
-    raise Exception("TELEGRAM_TOKEN manquant")
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-if not TELEGRAM_CHAT_ID:
-    raise Exception("TELEGRAM_CHAT_ID manquant")
+    response = requests.post(
+        url,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        },
+        timeout=20
+    )
 
-# Test FMP
-url = "https://financialmodelingprep.com/api/v3/quote/AAPL"
-response = requests.get(
-    url,
-    params={"apikey": FMP_API_KEY},
-    timeout=20
-)
+    print(response.status_code)
+    print(response.text)
 
-print("FMP Status:", response.status_code)
-print("FMP Response:", response.text[:300])
 
-# Test Telegram
-message = f"""
-🚀 AnisTrade
+def get_candidates():
+    url = "https://financialmodelingprep.com/stable/company-screener"
 
-FMP API OK : {response.status_code == 200}
+    params = {
+        "marketCapMoreThan": 300000000,
+        "marketCapLowerThan": 10000000000,
+        "volumeMoreThan": 300000,
+        "priceLowerThan": 50,
+        "isActivelyTrading": True,
+        "limit": 50,
+        "apikey": FMP_API_KEY
+    }
 
-Version Debug
-"""
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
 
-telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    return r.json()
 
-telegram_response = requests.post(
-    telegram_url,
-    json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    },
-    timeout=20
-)
 
-print("Telegram Status:", telegram_response.status_code)
-print("Telegram Response:", telegram_response.text)
+def get_price_target(symbol):
+    url = "https://financialmodelingprep.com/stable/price-target-consensus"
 
-telegram_response.raise_for_status()
+    params = {
+        "symbol": symbol,
+        "apikey": FMP_API_KEY
+    }
 
-print("SUCCESS")
+    try:
+        r = requests.get(url, params=params, timeout=20)
+
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+
+        if isinstance(data, list) and len(data) > 0:
+            return data[0]
+
+        if isinstance(data, dict):
+            return data
+
+        return None
+
+    except Exception:
+        return None
+
+
+def compute_score(price, consensus_target, market_cap):
+    if not price or not consensus_target:
+        return None
+
+    upside = ((consensus_target - price) / price) * 100
+
+    score = 0
+
+    score += min(max(upside, 0), 150) * 0.5
+
+    if market_cap < 1000000000:
+        score += 20
+    elif market_cap < 5000000000:
+        score += 15
+    else:
+        score += 10
+
+    return round(score, 1), round(upside, 1)
+
+
+def main():
+
+    if not FMP_API_KEY:
+        raise Exception("FMP_API_KEY manquant")
+
+    candidates = get_candidates()
+
+    results = []
+
+    for stock in candidates:
+
+        symbol = stock.get("symbol")
+        price = stock.get("price")
+        market_cap = stock.get("marketCap", 0)
+
+        if not symbol or not price:
+            continue
+
+        target_data = get_price_target(symbol)
+
+        if not target_data:
+            continue
+
+        consensus_target = (
+            target_data.get("targetConsensus")
+            or target_data.get("consensusTarget")
+            or target_data.get("priceTarget")
+        )
+
+        if not consensus_target:
+            continue
+
+        score_data = compute_score(
+            price,
+            consensus_target,
+            market_cap
+        )
+
+        if not score_data:
+            continue
+
+        score, upside = score_data
+
+        if upside < 50:
+            continue
+
+        results.append({
+            "symbol": symbol,
+            "price": price,
+            "target": consensus_target,
+            "upside": upside,
+            "score": score
+        })
+
+    results = sorted(
+        results,
+        key=lambda x: x["score"],
+        reverse=True
+    )[:TOP_N]
+
+    message = "🚀 AnisTrade V1\n\n"
+
+    if not results:
+        message += "Aucune opportunité détectée."
+    else:
+        for i, r in enumerate(results, start=1):
+            message += (
+                f"{i}. {r['symbol']}\n"
+                f"Prix : {r['price']}$\n"
+                f"Target : {r['target']}$\n"
+                f"Potentiel : +{r['upside']}%\n"
+                f"Score : {r['score']}\n\n"
+            )
+
+    send_telegram(message)
+
+
+if __name__ == "__main__":
+    main()
