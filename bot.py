@@ -120,6 +120,25 @@ def log(msg):
     print(msg, flush=True)
 
 
+def escape_html(text):
+    return (
+        str(text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _telegram_post_ok(resp):
+    try:
+        data = resp.json()
+    except ValueError:
+        return False, resp.text[:400]
+    if not data.get("ok"):
+        return False, data.get("description", resp.text[:400])
+    return True, None
+
+
 def send_telegram(message):
     if not message:
         log("⚠️ Telegram : message vide, envoi ignoré")
@@ -129,7 +148,7 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for i, chunk in enumerate(chunks, 1):
         sent = False
-        for parse_mode in ("Markdown", None):
+        for parse_mode in ("HTML", None):
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": chunk,
@@ -139,12 +158,14 @@ def send_telegram(message):
                 payload["parse_mode"] = parse_mode
             try:
                 resp = requests.post(url, json=payload, timeout=30)
-                if resp.ok:
+                ok, err = _telegram_post_ok(resp)
+                if ok:
                     sent = True
+                    log(f"✅ Telegram chunk {i}/{len(chunks)} ({parse_mode or 'plain'}, {len(chunk)} chars)")
                     break
                 log(
                     f"⚠️ Telegram chunk {i}/{len(chunks)} "
-                    f"({parse_mode or 'plain'}): {resp.status_code} {resp.text[:300]}"
+                    f"({parse_mode or 'plain'}): {err}"
                 )
             except Exception as e:
                 log(f"⚠️ Telegram chunk {i}/{len(chunks)}: {e}")
@@ -944,11 +965,11 @@ def format_etf_section(etf_data, spy_ret_20d):
     if not etf_data:
         return ""
     message = "━━━━━━━━━━━━━━━━\n"
-    message += "📊 *ETF — LONG TERME*\n"
+    message += "<b>📊 ETF — LONG TERME</b>\n"
     if spy_ret_20d is not None:
-        message += f"_PEA / CTO — croissance et thématiques (vs SPY 20j: {spy_ret_20d:+.1f}%)_\n\n"
+        message += f"<i>PEA / CTO — croissance et thématiques (vs SPY 20j: {spy_ret_20d:+.1f}%)</i>\n\n"
     else:
-        message += "_PEA / CTO — croissance et thématiques_\n\n"
+        message += "<i>PEA / CTO — croissance et thématiques</i>\n\n"
 
     best_ticker, best_rs = None, None
     for group in ("CROISSANCE", "IA", "SEMI"):
@@ -961,12 +982,12 @@ def format_etf_section(etf_data, spy_ret_20d):
         rows = etf_data.get(group, [])
         if not rows:
             continue
-        message += f"*{ETF_GROUP_LABELS[group]}*\n"
+        message += f"<b>{ETF_GROUP_LABELS[group]}</b>\n"
         for row in rows:
             star = " ⭐" if row["Ticker"] == best_ticker else ""
             rs = f" | RS:{row['RS20j']:+.1f}%" if row.get("RS20j") is not None else ""
             message += (
-                f"_{row['Ticker']}_{star} {row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | "
+                f"<i>{row['Ticker']}</i>{star} {row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | "
                 f"20j:{row['Var20j']:+.1f}%{rs} | {row['Prix']:.2f}$\n"
             )
         message += "\n"
@@ -1085,10 +1106,6 @@ def build_stealth_df(df_pool, options_map):
     return df
 
 
-def _safe_telegram_text(text):
-    return (text or "").replace("_", " ").replace("*", "´")
-
-
 def _format_sentiment_tags(row):
     tags = []
     if row.get("AnalystBuy"):
@@ -1097,31 +1114,32 @@ def _format_sentiment_tags(row):
     rb = row.get("RecBuyPct")
     if rb is not None:
         tags.append(f"FH:{rb:.0f}%Buy")
-    return " | _" + ", ".join(tags) + "_" if tags else ""
+    return " | <i>" + ", ".join(escape_html(t) for t in tags) + "</i>" if tags else ""
 
 
 def _format_stock_line(row, options_map, stealth=False):
     risk_emoji = row.get("RiskEmoji", "🟠")
-    risk_label = row.get("RiskLabel", "Moyen")
+    risk_label = escape_html(row.get("RiskLabel", "Moyen"))
+    ticker = escape_html(row["Ticker"])
     line = (
-        f"*{row['Ticker']}*\n"
-        f"_Momentum: {row.get('MomentumScore', 0):.0f} | "
+        f"<b>{ticker}</b>\n"
+        f"<i>Momentum: {row.get('MomentumScore', 0):.0f} | "
         f"Analystes: {row.get('AnalystScore', 0):.0f} | "
         f"Options: {row.get('OptionsScore', 0):.0f} | "
-        f"News: {row.get('SentimentScore', 50):.0f}_\n"
-        f"_Score global: {row.get('Score', 0):.0f} | Risque: {risk_emoji} {risk_label}_\n"
+        f"News: {row.get('SentimentScore', 50):.0f}</i>\n"
+        f"<i>Score global: {row.get('Score', 0):.0f} | Risque: {risk_emoji} {risk_label}</i>\n"
     )
     catalyst = row.get("Catalyst")
     if catalyst:
-        line += f"📰 _Catalyseur: {_safe_telegram_text(catalyst)}_\n"
+        line += f"📰 <i>Catalyseur: {escape_html(catalyst)}</i>\n"
     elif row.get("NegativeFdaNews"):
-        line += "📰 _Catalyseur: attention news FDA négatives_\n"
+        line += "📰 <i>Catalyseur: attention news FDA négatives</i>\n"
     line += (
         f"{row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | 20j:{row['Var20j']:+.1f}% | "
         f"Vol:{row['VolRatio']:.1f}x | {row['Prix']:.2f}$"
     )
     if row.get("Shorted"):
-        line += " | _short_"
+        line += " | <i>short</i>"
     line += _format_sentiment_tags(row) + "\n"
 
     contracts = options_map.get(row["Ticker"])
@@ -1130,14 +1148,14 @@ def _format_stock_line(row, options_map, stealth=False):
         prefix = "🕵️" if stealth else "🐳"
         line += (
             f"   {prefix} CALL {c['strike']:.1f} OTM +{c['otm_pct']:.0f}% {short_expiry(c['expiry'])} | "
-            f"Vol:{c['volume']:,} > OI:{c['oi']:,} | {c['vol_oi']:.1f}x\n"
+            f"Vol:{c['volume']:,} &gt; OI:{c['oi']:,} | {c['vol_oi']:.1f}x\n"
         )
     return line
 
 
 def _format_section_by_sector(df, title, options_map, max_n, stealth=False):
     if df.empty:
-        return f"{title}\n_Rien aujourd'hui — gardez votre cash._\n\n"
+        return f"{title}\n<i>Rien aujourd'hui — gardez votre cash.</i>\n\n"
     message = f"{title}\n"
     subset = df.head(max_n)
     grouped = {cat: [] for cat in SECTOR_ORDER}
@@ -1148,7 +1166,7 @@ def _format_section_by_sector(df, title, options_map, max_n, stealth=False):
         rows = grouped.get(cat, [])
         if not rows:
             continue
-        message += f"\n*{SECTOR_LABELS[cat]}*\n"
+        message += f"\n<b>{SECTOR_LABELS[cat]}</b>\n"
         for row in rows:
             message += _format_stock_line(row, options_map, stealth=stealth)
     return message + "\n"
@@ -1158,41 +1176,41 @@ def format_rising_stars_telegram(df_runners, df_stealth, df_x2, df_extended, spy
     spy_line = f"SPY 20j: {spy_ret_20d:+.1f}%" if spy_ret_20d is not None else ""
     fh_note = "Finnhub ✅" if FINNHUB_API_KEY else "Finnhub off"
     message = (
-        f"🚀 *AnisTrade — RISING STARS v7*\n"
-        f"_{spy_line} | Cap ≥{RUNNER_MIN_MARKET_CAP // 1_000_000}M$ | {fh_note}_\n\n"
+        f"🚀 <b>AnisTrade — RISING STARS v7</b>\n"
+        f"<i>{escape_html(spy_line)} | Cap &gt;= {RUNNER_MIN_MARKET_CAP // 1_000_000}M$ | {fh_note}</i>\n\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"📈 *ACTIONS*\n\n"
-        f"⚡ *SWING 1-4 SEMAINES*\n"
+        f"<b>📈 ACTIONS</b>\n\n"
+        f"<b>⚡ SWING 1-4 SEMAINES</b>\n"
     )
 
     message += _format_section_by_sector(
         df_runners,
-        "🌟 *RUNNERS* _(volume + momentum jour)_",
+        "<b>🌟 RUNNERS</b> <i>(volume + momentum jour)</i>",
         options_map, RUNNER_TOP_ALERTS,
     )
     message += _format_section_by_sector(
         df_stealth,
-        f"🕵️ *ACHATS FURTIFS* _(Vol max {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI min {STEALTH_MIN_OPT_VOL_OI}x)_",
+        f"<b>🕵️ ACHATS FURTIFS</b> <i>(Vol max {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI min {STEALTH_MIN_OPT_VOL_OI}x)</i>",
         options_map, STEALTH_TOP_ALERTS, stealth=True,
     )
 
     message += _format_section_by_sector(
         df_x2,
-        f"🚀 *POTENTIEL x2 — 12 MOIS* _(target ≥{X2_MIN_TARGET_UPSIDE:.0f}% + Buy/FH)_",
+        f"<b>🚀 POTENTIEL x2 — 12 MOIS</b> <i>(target &gt;= {X2_MIN_TARGET_UPSIDE:.0f}% + Buy/FH)</i>",
         options_map, X2_TOP_ALERTS,
     )
 
     if not df_extended.empty:
-        message += f"📈 *DÉJÀ EN RUN* _(>{RUNNER_MAX_VAR20:.0f}% 20j — trop tard pour x2)_\n"
+        message += f"<b>📈 DÉJÀ EN RUN</b> <i>(&gt;{RUNNER_MAX_VAR20:.0f}% 20j — trop tard pour x2)</i>\n"
         for _, row in df_extended.head(EXTENDED_TOP_ALERTS).iterrows():
-            message += f"_{row['Ticker']}_ {row['Var20j']:+.0f}% | {row['Prix']:.0f}$ | Vol:{row['VolRatio']:.1f}x\n"
+            message += f"<i>{row['Ticker']}</i> {row['Var20j']:+.0f}% | {row['Prix']:.0f}$ | Vol:{row['VolRatio']:.1f}x\n"
         message += "\n"
 
     if df_runners.empty and df_stealth.empty and df_x2.empty:
-        message += "💤 _Aucun signal action fort aujourd'hui._\n\n"
+        message += "💤 <i>Aucun signal action fort aujourd'hui.</i>\n\n"
 
     message += format_etf_section(etf_data, spy_ret_20d)
-    message += "⚠️ _Pas de garantie +100%. Vérifiez catalyseurs avant trade._"
+    message += "⚠️ <i>Pas de garantie +100%. Vérifiez catalyseurs avant trade.</i>"
     return message
 
 
@@ -1232,6 +1250,7 @@ def main():
     message = format_rising_stars_telegram(
         df_runners, df_stealth, df_x2, df_extended, spy_ret_20d, options_map, etf_data,
     )
+    log(f"📨 Message Telegram : {len(message)} caractères")
     send_telegram(message)
     log("🚀 Alerte Rising Stars envoyée !")
 
