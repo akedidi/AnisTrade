@@ -65,16 +65,37 @@ MENU_LABELS = {
     "furtifs": "🕵️ Furtifs",
     "extended": "📈 Déjà en run",
 }
-MENU_BY_TEXT = {v: k for k, v in MENU_LABELS.items()}
 
-MENU_KEYBOARD = {
-    "keyboard": [
-        [MENU_LABELS["highlights"], MENU_LABELS["actions"]],
-        [MENU_LABELS["etfs"], MENU_LABELS["runners"]],
-        [MENU_LABELS["furtifs"], MENU_LABELS["extended"]],
-    ],
-    "resize_keyboard": True,
+# Commandes du menu natif Telegram (bouton / à côté du champ de saisie)
+BOT_COMMANDS = [
+    {"command": "start", "description": "S'abonner aux alertes Highlights"},
+    {"command": "highlights", "description": "Top actions + ETF"},
+    {"command": "actions", "description": "Actions par secteur"},
+    {"command": "etfs", "description": "ETF par catégorie"},
+    {"command": "runners", "description": "Runners (vol + momentum)"},
+    {"command": "furtifs", "description": "Achats furtifs (options)"},
+    {"command": "dejarenrun", "description": "Déjà en run (>60% 20j)"},
+    {"command": "menu", "description": "Afficher les commandes"},
+]
+COMMAND_TO_ACTION = {
+    "/highlights": "highlights",
+    "/actions": "actions",
+    "/etfs": "etfs",
+    "/runners": "runners",
+    "/furtifs": "furtifs",
+    "/dejarenrun": "extended",
+    "/extended": "extended",
 }
+MENU_HELP = (
+    "📋 <b>Commandes AnisTrade</b>\n"
+    "Tapez <b>/</b> ou ouvrez le menu du bot :\n\n"
+    "/highlights — top actions + ETF\n"
+    "/actions — actions par secteur\n"
+    "/etfs — ETF par catégorie\n"
+    "/runners — momentum + volume\n"
+    "/furtifs — achats furtifs\n"
+    "/dejarenrun — déjà en run"
+)
 
 STEALTH_MAX_VOL_RATIO = 1.5
 STEALTH_MIN_OPT_VOL_OI = 5.0
@@ -139,7 +160,7 @@ OPTIONS_CONTRACTS_PER_TICKER = 2
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
 WELCOME_MESSAGE = (
     "✅ <b>AnisTrade</b> — abonnement confirmé.\n"
-    "Utilisez le menu ci-dessous pour explorer les signaux.\n"
+    "Ouvrez le menu du bot (bouton <b>/</b>) pour explorer les signaux.\n"
     "Les <b>Highlights</b> automatiques sont envoyés à chaque alerte planifiée."
 )
 SCAN_CACHE_TTL_SEC = 900
@@ -224,12 +245,26 @@ def _send_raw_telegram(chat_id, text, parse_mode="HTML", reply_markup=None):
     return True
 
 
-def send_with_menu(chat_id, text):
-    """Envoie un message avec le clavier menu à un seul chat."""
-    chunks = _split_telegram_message(text)
-    for i, chunk in enumerate(chunks):
-        markup = MENU_KEYBOARD if i == len(chunks) - 1 else None
-        _send_raw_telegram(chat_id, chunk, reply_markup=markup)
+def register_bot_commands():
+    """Enregistre le menu de commandes dans le bot Telegram (pas de clavier canal)."""
+    if not TELEGRAM_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
+    try:
+        resp = requests.post(url, json={"commands": BOT_COMMANDS}, timeout=15)
+        ok, err = _telegram_post_ok(resp)
+        if ok:
+            log("📋 Menu bot enregistré (commandes /)")
+        else:
+            log(f"⚠️ setMyCommands : {err}")
+    except Exception as e:
+        log(f"⚠️ setMyCommands : {e}")
+
+
+def send_to_chat(chat_id, text):
+    """Envoie un message à un seul utilisateur (sans clavier reply)."""
+    for chunk in _split_telegram_message(text):
+        _send_raw_telegram(chat_id, chunk)
 
 
 def _handle_start(chat_id, data):
@@ -238,13 +273,14 @@ def _handle_start(chat_id, data):
         data["chat_ids"].append(chat_id)
         new = 1
         log(f"📬 Nouvel abonné : {chat_id}")
-    send_with_menu(chat_id, WELCOME_MESSAGE)
+    # Retire un ancien clavier reply s'il existait
+    _send_raw_telegram(chat_id, WELCOME_MESSAGE, reply_markup={"remove_keyboard": True})
     return new
 
 
 def _handle_menu_action(chat_id, action_key):
-    log(f"📲 Menu '{action_key}' demandé par {chat_id}")
-    send_with_menu(chat_id, "⏳ <i>Analyse en cours…</i>")
+    log(f"📲 Commande '{action_key}' demandée par {chat_id}")
+    send_to_chat(chat_id, "⏳ <i>Analyse en cours…</i>")
     try:
         scan = get_scan_data(force=True)
         formatters = {
@@ -257,11 +293,10 @@ def _handle_menu_action(chat_id, action_key):
             "furtifs": lambda: format_furtifs_telegram(scan["df_stealth"], scan["options_map"], scan["spy_ret_20d"]),
             "extended": lambda: format_extended_telegram(scan["df_extended"], scan["spy_ret_20d"]),
         }
-        message = formatters[action_key]()
-        send_with_menu(chat_id, message)
+        send_to_chat(chat_id, formatters[action_key]())
     except Exception as e:
-        log(f"⚠️ Menu {action_key} pour {chat_id}: {e}")
-        send_with_menu(chat_id, f"⚠️ Erreur : {escape_html(str(e)[:200])}")
+        log(f"⚠️ Commande {action_key} pour {chat_id}: {e}")
+        send_to_chat(chat_id, f"⚠️ Erreur : {escape_html(str(e)[:200])}")
 
 
 def process_telegram_updates(handle_menus=False):
@@ -298,13 +333,13 @@ def process_telegram_updates(handle_menus=False):
             new_subs += _handle_start(chat_id, data)
             continue
         if cmd == "/menu":
-            send_with_menu(chat_id, "📋 <b>Menu AnisTrade</b> — choisissez une section :")
+            send_to_chat(chat_id, MENU_HELP)
             continue
 
         if not handle_menus:
             continue
 
-        action_key = MENU_BY_TEXT.get(text)
+        action_key = COMMAND_TO_ACTION.get(cmd)
         if action_key:
             if chat_id not in data["chat_ids"]:
                 data["chat_ids"].append(chat_id)
@@ -312,7 +347,7 @@ def process_telegram_updates(handle_menus=False):
             try:
                 _handle_menu_action(chat_id, action_key)
             except Exception as e:
-                log(f"⚠️ Action menu : {e}")
+                log(f"⚠️ Action commande : {e}")
 
     if new_subs or updates:
         save_subscribers(data)
@@ -1529,6 +1564,7 @@ def main():
     if not TELEGRAM_TOKEN:
         raise Exception("Secret TELEGRAM_TOKEN manquant. Vérifiez vos Secrets GitHub.")
 
+    register_bot_commands()
     process_telegram_updates(handle_menus=True)
     if not get_subscriber_chat_ids():
         raise Exception(
@@ -1547,7 +1583,8 @@ def main():
 def run_bot_polling():
     if not TELEGRAM_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN manquant")
-    log("🤖 Bot AnisTrade — menu interactif (Ctrl+C pour arrêter)")
+    register_bot_commands()
+    log("🤖 Bot AnisTrade — commandes / (Ctrl+C pour arrêter)")
     while True:
         process_telegram_updates(handle_menus=True)
         time.sleep(2)
