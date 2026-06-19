@@ -1,10 +1,12 @@
 name: AnisTrade
 
 on:
-  workflow_dispatch: # Autorise l'exécution manuelle via le bouton
+  workflow_dispatch:
   schedule:
-    # Exécution auto à 14:00 UTC (16h00 Paris), du Lundi au Vendredi
     - cron: '0 14 * * 1-5'
+
+permissions:
+  contents: write
 
 jobs:
   run-bot:
@@ -31,3 +33,11 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: |
           python -u bot.py
+
+      - name: Persist subscribers
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add subscribers.json
+          git diff --staged --quiet || git commit -m "Update Telegram subscribers"
+          git push

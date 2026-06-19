@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import logging
 from datetime import datetime, timedelta
@@ -110,6 +111,12 @@ OPTIONS_OTM_MIN_PCT = 1.02
 OPTIONS_DELAY_SEC = 0.25
 OPTIONS_CONTRACTS_PER_TICKER = 2
 
+SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
+WELCOME_MESSAGE = (
+    "✅ <b>AnisTrade</b> — abonnement confirmé.\n"
+    "Vous recevrez les alertes <b>Highlights</b> (actions + ETF)."
+)
+
 
 def to_yahoo_symbol(symbol: str) -> str:
     return symbol.replace(".", "-")
@@ -138,18 +145,109 @@ def _telegram_post_ok(resp):
     return True, None
 
 
-def send_telegram(message):
-    if not message:
-        log("⚠️ Telegram : message vide, envoi ignoré")
-        return
+def _default_subscribers():
+    return {"chat_ids": [], "update_offset": 0}
 
+
+def load_subscribers():
+    data = _default_subscribers()
+    if os.path.exists(SUBSCRIBERS_FILE):
+        try:
+            with open(SUBSCRIBERS_FILE, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded.get("chat_ids"), list):
+                data["chat_ids"] = [str(c) for c in loaded["chat_ids"]]
+            if isinstance(loaded.get("update_offset"), int):
+                data["update_offset"] = loaded["update_offset"]
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"⚠️ subscribers.json illisible : {e}")
+    if TELEGRAM_CHAT_ID:
+        chat_id = str(TELEGRAM_CHAT_ID)
+        if chat_id not in data["chat_ids"]:
+            data["chat_ids"].append(chat_id)
+    return data
+
+
+def save_subscribers(data):
+    with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def get_subscriber_chat_ids():
+    return load_subscribers().get("chat_ids", [])
+
+
+def _send_raw_telegram(chat_id, text, parse_mode="HTML"):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    resp = requests.post(url, json=payload, timeout=30)
+    ok, err = _telegram_post_ok(resp)
+    if not ok:
+        raise RuntimeError(f"Telegram {chat_id}: {err}")
+    return True
+
+
+def process_telegram_updates():
+    """Traite les /start en attente et enregistre les chat_id dans subscribers.json."""
+    if not TELEGRAM_TOKEN:
+        return load_subscribers()
+
+    data = load_subscribers()
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"offset": data.get("update_offset", 0), "timeout": 0, "allowed_updates": ["message"]}
+
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        ok, err = _telegram_post_ok(resp)
+        if not ok:
+            log(f"⚠️ getUpdates : {err}")
+            return data
+        updates = resp.json().get("result", [])
+    except Exception as e:
+        log(f"⚠️ getUpdates : {e}")
+        return data
+
+    new_subs = 0
+    for update in updates:
+        data["update_offset"] = update["update_id"] + 1
+        message = update.get("message")
+        if not message:
+            continue
+        text = (message.get("text") or "").strip()
+        cmd = text.split()[0].split("@")[0].lower() if text else ""
+        if cmd != "/start":
+            continue
+        chat_id = str(message["chat"]["id"])
+        if chat_id not in data["chat_ids"]:
+            data["chat_ids"].append(chat_id)
+            new_subs += 1
+            log(f"📬 Nouvel abonné : {chat_id}")
+        try:
+            _send_raw_telegram(chat_id, WELCOME_MESSAGE)
+        except Exception as e:
+            log(f"⚠️ Message bienvenue {chat_id}: {e}")
+
+    if new_subs or updates:
+        save_subscribers(data)
+        log(f"📬 Abonnés : {len(data['chat_ids'])} (+{new_subs} nouveau(x))")
+    return data
+
+
+def _send_telegram_to_chat(message, chat_id):
     chunks = _split_telegram_message(message)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for i, chunk in enumerate(chunks, 1):
         sent = False
         for parse_mode in ("HTML", None):
             payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": chat_id,
                 "text": chunk,
                 "disable_web_page_preview": True,
             }
@@ -160,16 +258,32 @@ def send_telegram(message):
                 ok, err = _telegram_post_ok(resp)
                 if ok:
                     sent = True
-                    log(f"✅ Telegram chunk {i}/{len(chunks)} ({parse_mode or 'plain'}, {len(chunk)} chars)")
+                    log(
+                        f"✅ Telegram → {chat_id} chunk {i}/{len(chunks)} "
+                        f"({parse_mode or 'plain'}, {len(chunk)} chars)"
+                    )
                     break
-                log(
-                    f"⚠️ Telegram chunk {i}/{len(chunks)} "
-                    f"({parse_mode or 'plain'}): {err}"
-                )
+                log(f"⚠️ Telegram → {chat_id} chunk {i} ({parse_mode or 'plain'}): {err}")
             except Exception as e:
-                log(f"⚠️ Telegram chunk {i}/{len(chunks)}: {e}")
+                log(f"⚠️ Telegram → {chat_id} chunk {i}: {e}")
         if not sent:
-            raise RuntimeError(f"Échec envoi Telegram (chunk {i}/{len(chunks)})")
+            raise RuntimeError(f"Échec envoi Telegram → {chat_id} (chunk {i}/{len(chunks)})")
+
+
+def send_telegram(message):
+    if not message:
+        log("⚠️ Telegram : message vide, envoi ignoré")
+        return
+
+    chat_ids = get_subscriber_chat_ids()
+    if not chat_ids:
+        raise RuntimeError(
+            "Aucun abonné Telegram. Envoyez /start au bot ou définissez TELEGRAM_CHAT_ID."
+        )
+
+    log(f"📤 Envoi à {len(chat_ids)} abonné(s)...")
+    for chat_id in chat_ids:
+        _send_telegram_to_chat(message, chat_id)
 
 
 def _split_telegram_message(message, limit=4000):
@@ -1149,15 +1263,10 @@ def _format_highlight_etf(row, best=False):
 
 
 def format_highlights_telegram(stock_highlights, etf_highlights, spy_ret_20d, options_map):
-    spy = ""
+    message = "🚀 <b>AnisTrade — Highlights</b>\n"
     if spy_ret_20d is not None and not (isinstance(spy_ret_20d, float) and pd.isna(spy_ret_20d)):
-        spy = f"SPY 20j: {spy_ret_20d:+.1f}%"
-    fh = "Finnhub ✅" if FINNHUB_API_KEY else "Finnhub off"
-    message = (
-        f"🚀 <b>AnisTrade — Highlights</b>\n"
-        f"<i>{escape_html(spy)} | {fh}</i>\n\n"
-        f"<b>📈 ACTIONS</b> <i>(top {HIGHLIGHT_MAX_STOCKS})</i>\n"
-    )
+        message += f"<i>SPY 20j: {spy_ret_20d:+.1f}%</i>\n"
+    message += f"\n<b>📈 ACTIONS</b> <i>(top {HIGHLIGHT_MAX_STOCKS})</i>\n"
     if stock_highlights:
         for row in stock_highlights:
             message += _format_highlight_stock(row, options_map)
@@ -1176,8 +1285,14 @@ def format_highlights_telegram(stock_highlights, etf_highlights, spy_ret_20d, op
 
 
 def main():
-    if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-        raise Exception("Secrets Telegram manquants. Vérifiez vos Secrets GitHub.")
+    if not TELEGRAM_TOKEN:
+        raise Exception("Secret TELEGRAM_TOKEN manquant. Vérifiez vos Secrets GitHub.")
+
+    process_telegram_updates()
+    if not get_subscriber_chat_ids():
+        raise Exception(
+            "Aucun abonné Telegram. Envoyez /start au bot ou définissez TELEGRAM_CHAT_ID."
+        )
 
     nasdaq_stocks, _ = fetch_nasdaq_trader_symbols()
     stock_quotes, sources = fetch_screener_universe()
@@ -1222,4 +1337,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--poll-subscribers":
+        if not TELEGRAM_TOKEN:
+            raise SystemExit("TELEGRAM_TOKEN manquant")
+        log("📬 Écoute /start (Ctrl+C pour arrêter)...")
+        while True:
+            process_telegram_updates()
+            time.sleep(3)
+    else:
+        main()
