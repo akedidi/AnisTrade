@@ -21,7 +21,7 @@ OTHER_EXCHANGES = {"N", "A", "P", "Z"}
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
-USER_AGENT = "AnisTradeBot/6.0 (rising-stars)"
+USER_AGENT = "AnisTradeBot/7.0 (rising-stars)"
 
 US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "PCX", "BTS", "ASE"}
 
@@ -47,6 +47,7 @@ BUY_RATINGS = {"buy", "strong_buy", "strongbuy", "outperform", "overweight"}
 RUNNER_MAX_DOWNLOAD = 120
 RUNNER_TOP_ALERTS = 15
 STEALTH_TOP_ALERTS = 10
+X2_TOP_ALERTS = 8
 EXTENDED_TOP_ALERTS = 5
 EXTENDED_MIN_PRICE = 3.0
 
@@ -54,9 +55,13 @@ STEALTH_MAX_VOL_RATIO = 1.5
 STEALTH_MIN_OPT_VOL_OI = 5.0
 STEALTH_MIN_VAR1D = -8.0
 
-SCORE_W_MOMENTUM = 0.40
-SCORE_W_ANALYST = 0.35
+SCORE_W_MOMENTUM = 0.35
+SCORE_W_ANALYST = 0.30
 SCORE_W_OPTIONS = 0.25
+SCORE_W_SENTIMENT = 0.10
+
+X2_MIN_TARGET_UPSIDE = 50.0
+X2_STRONG_TARGET_UPSIDE = 80.0
 
 CHUNK_SIZE = 80
 CHUNK_DELAY_SEC = 0.25
@@ -87,6 +92,15 @@ FDA_NEGATIVE_KW = (
     "fda reject", "complete response letter", "clinical hold",
     "trial failure", "failed to meet", "did not meet primary",
     "phase 3 fail", "phase iii fail", "halts trial", "drug rejected",
+)
+
+CATALYST_RULES = (
+    (("pdufa", "fda approval", "fda decision", "fda accepts"), "FDA / PDUFA"),
+    (("phase 3", "phase iii", "phase 3 data", "pivotal trial"), "Phase III"),
+    (("acquisition", "buyout", "merger", "takeover", "to be acquired"), "Rachat / M&A"),
+    (("short squeeze", "high short interest"), "Short squeeze"),
+    (("earnings beat", "raises guidance", "upgraded to"), "Résultats / guidance"),
+    (("partnership", "licensing deal", "collaboration"), "Partenariat"),
 )
 
 OPTIONS_MAX_EXPIRATIONS = 2
@@ -393,6 +407,80 @@ def pct_return(series, days):
     return (float(series.iloc[-1]) / base - 1) * 100
 
 
+def annualized_volatility(closes, days=30):
+    if closes is None or len(closes) < days + 2:
+        return None
+    rets = closes.pct_change().dropna().tail(days)
+    if len(rets) < 5:
+        return None
+    return float(rets.std() * (252 ** 0.5) * 100)
+
+
+def risk_level(beta, short_pct, vol_30d):
+    """Risque composite : beta, short interest, volatilité 30j → Faible / Moyen / Élevé."""
+    points = 0
+    components = 0
+    if beta is not None:
+        components += 1
+        if beta >= 1.8:
+            points += 2
+        elif beta >= 1.2:
+            points += 1
+    if short_pct is not None:
+        components += 1
+        if short_pct >= 20:
+            points += 2
+        elif short_pct >= 10:
+            points += 1
+    if vol_30d is not None:
+        components += 1
+        if vol_30d >= 70:
+            points += 2
+        elif vol_30d >= 45:
+            points += 1
+    if components == 0:
+        return "Moyen", "🟠"
+    avg = points / components
+    if avg >= 1.5:
+        return "Élevé", "🔴"
+    if avg >= 0.75:
+        return "Moyen", "🟠"
+    return "Faible", "🟢"
+
+
+def detect_catalyst_from_text(text):
+    t = (text or "").lower()
+    for keywords, label in CATALYST_RULES:
+        if any(kw in t for kw in keywords):
+            return label
+    return None
+
+
+def format_earnings_date(ts):
+    if not ts:
+        return None
+    try:
+        if isinstance(ts, (int, float)):
+            dt = datetime.fromtimestamp(ts)
+        else:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return dt.strftime("%d %b")
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def sentiment_score(finnhub):
+    if not finnhub:
+        return 50
+    np_ = finnhub.get("news_pct")
+    if np_ is not None:
+        return round(min(max(float(np_), 0), 100), 0)
+    ns = finnhub.get("news_score")
+    if ns is not None:
+        return round(min(max(float(ns) * 100, 0), 100), 0)
+    return 50
+
+
 def fetch_analyst_meta(tickers):
     log(f"📊 Métadonnées Yahoo ({len(tickers)} tickers)...")
     meta = {}
@@ -400,6 +488,7 @@ def fetch_analyst_meta(tickers):
         entry = {
             "recommendation": "", "is_buy": False, "target": None,
             "upside_pct": None, "market_cap": None, "sector": "", "industry": "", "category": "Autre",
+            "beta": None, "short_pct": None, "earnings_date": None,
         }
         try:
             info = yf.Ticker(to_yahoo_symbol(ticker)).info
@@ -407,6 +496,11 @@ def fetch_analyst_meta(tickers):
             target = info.get("targetMeanPrice") or info.get("targetMedianPrice")
             price = info.get("currentPrice") or info.get("regularMarketPrice")
             sector, industry = info.get("sector") or "", info.get("industry") or ""
+            beta = info.get("beta")
+            short_pct = info.get("shortPercentOfFloat") or info.get("shortRatio")
+            if short_pct is not None and short_pct <= 1:
+                short_pct = float(short_pct) * 100
+            earnings_ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
             entry.update({
                 "recommendation": rec,
                 "is_buy": rec in BUY_RATINGS,
@@ -414,6 +508,9 @@ def fetch_analyst_meta(tickers):
                 "sector": sector,
                 "industry": industry,
                 "category": classify_sector(sector, industry),
+                "beta": float(beta) if beta is not None else None,
+                "short_pct": float(short_pct) if short_pct is not None else None,
+                "earnings_date": format_earnings_date(earnings_ts),
             })
             if target and price and float(price) > 0:
                 entry["target"] = float(target)
@@ -434,7 +531,7 @@ def fetch_finnhub_meta(tickers):
         "bullish_pct": None, "bearish_pct": None,
         "social_score": None, "social_pct": None,
         "price_target": None, "price_target_upside": None,
-        "negative_fda_news": False, "finnhub_ok": False,
+        "negative_fda_news": False, "catalyst": None, "finnhub_ok": False,
     }
     if not FINNHUB_API_KEY:
         log("📊 Finnhub : clé absente — sentiment ignoré")
@@ -505,11 +602,30 @@ def fetch_finnhub_meta(tickers):
             )
             if cn_resp.ok:
                 for article in cn_resp.json() or []:
-                    headline = (article.get("headline") or "").lower()
-                    summary = (article.get("summary") or "").lower()
+                    headline = article.get("headline") or ""
+                    summary = article.get("summary") or ""
                     text = f"{headline} {summary}"
-                    if any(kw in text for kw in FDA_NEGATIVE_KW):
+                    text_l = text.lower()
+                    if any(kw in text_l for kw in FDA_NEGATIVE_KW):
                         entry["negative_fda_news"] = True
+                    if not entry["catalyst"]:
+                        cat = detect_catalyst_from_text(text)
+                        if cat:
+                            entry["catalyst"] = cat
+                            if cat == "Résultats / guidance" and headline:
+                                entry["catalyst"] = f"{cat} — {headline[:60]}"
+            time.sleep(FINNHUB_DELAY_SEC)
+
+            earn_resp = requests.get(
+                f"{FINNHUB_BASE}/calendar/earnings",
+                params={**params, "from": today.isoformat(), "to": (today + timedelta(days=120)).isoformat()},
+                timeout=10,
+            )
+            if earn_resp.ok and not entry.get("catalyst"):
+                for ev in earn_resp.json() or []:
+                    if (ev.get("symbol") or "").upper() == ticker:
+                        ed = ev.get("date") or ev.get("period")
+                        entry["catalyst"] = f"Résultats le {ed}" if ed else "Résultats à venir"
                         break
 
             entry["finnhub_ok"] = True
@@ -593,11 +709,12 @@ def options_score(top_vol_oi):
     return round(min(top_vol_oi * 10, 45), 0)
 
 
-def global_score(momentum, analyst, options):
+def global_score(momentum, analyst, options, sentiment):
     return round(
         SCORE_W_MOMENTUM * (momentum or 0)
         + SCORE_W_ANALYST * (analyst or 0)
-        + SCORE_W_OPTIONS * (options or 0),
+        + SCORE_W_OPTIONS * (options or 0)
+        + SCORE_W_SENTIMENT * (sentiment or 50),
         0,
     )
 
@@ -610,7 +727,8 @@ def compute_scores(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accel
     m = momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating)
     a = analyst_score(is_buy, target_upside, price, finnhub)
     o = options_score(top_vol_oi)
-    return m, a, o, global_score(m, a, o)
+    s = sentiment_score(finnhub)
+    return m, a, o, s, global_score(m, a, o, s)
 
 
 def get_spy_benchmark():
@@ -620,14 +738,19 @@ def get_spy_benchmark():
     return pct_return(closes["SPY"], 20)
 
 
-def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, finnhub, spy_ret_20d, top_vol_oi=None):
+def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, finnhub, vol_30d=None, top_vol_oi=None):
     is_shorted = ticker in sources["shorted"]
     accelerating = var_5d is not None and var_20d is not None and var_5d > 0 and var_5d > (var_20d / 4)
-    m, a, o, g = compute_scores(
-        var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating,
-        analyst.get("is_buy", False), analyst.get("upside_pct"), price, finnhub, top_vol_oi,
-    )
     fh = finnhub or {}
+    m, a, o, s, g = compute_scores(
+        var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating,
+        analyst.get("is_buy", False), analyst.get("upside_pct"), price, fh, top_vol_oi,
+    )
+    beta, short_pct = analyst.get("beta"), analyst.get("short_pct")
+    risk_label, risk_emoji = risk_level(beta, short_pct, vol_30d)
+    catalyst = fh.get("catalyst")
+    if not catalyst and analyst.get("earnings_date"):
+        catalyst = f"Résultats le {analyst['earnings_date']}"
     return {
         "Ticker": ticker,
         "Prix": price,
@@ -636,6 +759,9 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
         "Var20j": var_20d or 0,
         "RS20j": rs_20d or 0,
         "VolRatio": vol_ratio,
+        "Vol30d": vol_30d,
+        "Beta": beta,
+        "ShortPct": short_pct,
         "Shorted": is_shorted,
         "AnalystBuy": analyst.get("is_buy", False),
         "TargetUpside": analyst.get("upside_pct"),
@@ -643,7 +769,11 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
         "MomentumScore": m,
         "AnalystScore": a,
         "OptionsScore": o,
+        "SentimentScore": s,
         "Score": g,
+        "RiskLabel": risk_label,
+        "RiskEmoji": risk_emoji,
+        "Catalyst": catalyst,
         "TopVolOI": top_vol_oi,
         "NewsScore": fh.get("news_score"),
         "NewsPct": fh.get("news_pct"),
@@ -677,6 +807,7 @@ def analyze_candidates(tickers, sources, spy_ret_20d):
             continue
 
         var_1d, var_5d, var_20d = pct_return(c, 1), pct_return(c, 5), pct_return(c, 20)
+        vol_30d = annualized_volatility(c, 30)
         prior_vol = v.iloc[:-1]
         avg_vol = float(prior_vol.tail(20).mean()) if len(prior_vol) >= 5 else float(prior_vol.mean())
         vol_ratio = float(v.iloc[-1]) / avg_vol if avg_vol > 0 else 0
@@ -684,13 +815,13 @@ def analyze_candidates(tickers, sources, spy_ret_20d):
 
         if var_20d is not None and var_20d > RUNNER_MAX_VAR20:
             if price >= EXTENDED_MIN_PRICE:
-                extended.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, spy_ret_20d))
+                extended.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, vol_30d))
             continue
 
         if var_20d is None or var_20d < RUNNER_MIN_VAR20 or (rs_20d is not None and rs_20d < 0):
             continue
 
-        momentum_pool.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, spy_ret_20d))
+        momentum_pool.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, vol_30d))
 
     runners, stealth_pool = [], []
     for row in momentum_pool:
@@ -710,38 +841,37 @@ def analyze_candidates(tickers, sources, spy_ret_20d):
         df_extended = df_extended.sort_values(by="Var20j", ascending=False)
 
     log(f"   🌟 {len(df_runners)} runners | 🕵️ {len(df_stealth_pool)} pool furtif | 📈 {len(df_extended)} étirés")
-    return df_runners, df_stealth_pool, df_extended
+    df_momentum = pd.DataFrame(momentum_pool)
+    return df_runners, df_stealth_pool, df_extended, df_momentum
 
 
-def enrich_with_finnhub(df_runners, df_stealth, df_extended):
+def enrich_with_finnhub(df_runners, df_stealth, df_extended, df_momentum=None):
     tickers = set()
-    for df in (df_runners, df_stealth, df_extended):
-        if not df.empty:
+    for df in (df_runners, df_stealth, df_extended, df_momentum):
+        if df is not None and not df.empty:
             tickers.update(df["Ticker"].tolist())
     if not tickers:
-        return df_runners, df_stealth, df_extended
+        return df_runners, df_stealth, df_extended, df_momentum
 
     fh = fetch_finnhub_meta(sorted(tickers))
 
-    def _apply(df, options_map=None):
-        if df.empty:
+    def _apply(df):
+        if df is None or df.empty:
             return df
         rows = []
         for _, row in df.iterrows():
             r = row.to_dict()
             meta = fh.get(r["Ticker"], {})
             top_vol_oi = r.get("TopVolOI")
-            if options_map and r["Ticker"] in options_map:
-                contracts = options_map[r["Ticker"]]
-                if contracts:
-                    top_vol_oi = contracts[0]["vol_oi"]
-            m, a, o, g = compute_scores(
+            m, a, o, s, g = compute_scores(
                 r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
                 r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
                 r["AnalystBuy"], r["TargetUpside"], r["Prix"], meta, top_vol_oi,
             )
+            catalyst = meta.get("catalyst") or r.get("Catalyst")
             r.update({
-                "MomentumScore": m, "AnalystScore": a, "OptionsScore": o, "Score": g,
+                "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
+                "SentimentScore": s, "Score": g,
                 "TopVolOI": top_vol_oi,
                 "NewsScore": meta.get("news_score"),
                 "NewsPct": meta.get("news_pct"),
@@ -749,6 +879,7 @@ def enrich_with_finnhub(df_runners, df_stealth, df_extended):
                 "SocialPct": meta.get("social_pct"),
                 "BullishPct": meta.get("bullish_pct"),
                 "NegativeFdaNews": meta.get("negative_fda_news", False),
+                "Catalyst": catalyst,
             })
             rows.append(r)
         out = pd.DataFrame(rows)
@@ -756,7 +887,27 @@ def enrich_with_finnhub(df_runners, df_stealth, df_extended):
             out = out.sort_values(by=["Score", "Var20j"], ascending=False)
         return out
 
-    return _apply(df_runners), _apply(df_stealth), _apply(df_extended)
+    return _apply(df_runners), _apply(df_stealth), _apply(df_extended), _apply(df_momentum)
+
+
+def build_x2_df(df_momentum):
+    if df_momentum is None or df_momentum.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, row in df_momentum.iterrows():
+        up = row.get("TargetUpside")
+        rb = row.get("RecBuyPct")
+        qualifies = False
+        if up is not None and up >= X2_STRONG_TARGET_UPSIDE:
+            qualifies = True
+        elif up is not None and up >= X2_MIN_TARGET_UPSIDE and (row.get("AnalystBuy") or (rb and rb >= 60)):
+            qualifies = True
+        if qualifies:
+            rows.append(row.to_dict())
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    return df.sort_values(by=["AnalystScore", "TargetUpside", "Score"], ascending=False)
 
 
 def analyze_etf_watchlist(spy_ret_20d):
@@ -792,20 +943,30 @@ def analyze_etf_watchlist(spy_ret_20d):
 def format_etf_section(etf_data, spy_ret_20d):
     if not etf_data:
         return ""
-    message = "📊 *ETF — LONG TERME*\n"
+    message = "━━━━━━━━━━━━━━━━\n"
+    message += "📊 *ETF — LONG TERME*\n"
     if spy_ret_20d is not None:
-        message += f"_PEA / CTO — croissance & thématiques (vs SPY 20j: {spy_ret_20d:+.1f}%)_\n\n"
+        message += f"_PEA / CTO — croissance et thématiques (vs SPY 20j: {spy_ret_20d:+.1f}%)_\n\n"
     else:
-        message += "_PEA / CTO — croissance & thématiques_\n\n"
+        message += "_PEA / CTO — croissance et thématiques_\n\n"
+
+    best_ticker, best_rs = None, None
+    for group in ("CROISSANCE", "IA", "SEMI"):
+        for row in etf_data.get(group, []):
+            rs = row.get("RS20j", 0)
+            if best_rs is None or rs > best_rs:
+                best_rs, best_ticker = rs, row["Ticker"]
+
     for group in ("CROISSANCE", "IA", "SEMI"):
         rows = etf_data.get(group, [])
         if not rows:
             continue
         message += f"*{ETF_GROUP_LABELS[group]}*\n"
         for row in rows:
-            rs = f" | RS:{row['RS20j']:+.1f}%" if row.get("RS20j") else ""
+            star = " ⭐" if row["Ticker"] == best_ticker else ""
+            rs = f" | RS:{row['RS20j']:+.1f}%" if row.get("RS20j") is not None else ""
             message += (
-                f"_{row['Ticker']}_ {row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | "
+                f"_{row['Ticker']}_{star} {row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | "
                 f"20j:{row['Var20j']:+.1f}%{rs} | {row['Prix']:.2f}$\n"
             )
         message += "\n"
@@ -822,12 +983,15 @@ def apply_options_scores(df, options_map):
         contracts = options_map.get(r["Ticker"])
         if contracts:
             top_vol_oi = contracts[0]["vol_oi"]
-        m, a, o, g = compute_scores(
+        m, a, o, s, g = compute_scores(
             r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
             r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
             r["AnalystBuy"], r["TargetUpside"], r["Prix"], {}, top_vol_oi,
         )
-        r.update({"MomentumScore": m, "AnalystScore": a, "OptionsScore": o, "Score": g, "TopVolOI": top_vol_oi})
+        r.update({
+            "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
+            "SentimentScore": s, "Score": g, "TopVolOI": top_vol_oi,
+        })
         rows.append(r)
     out = pd.DataFrame(rows)
     return out.sort_values(by=["Score", "Var20j"], ascending=False) if not out.empty else out
@@ -921,21 +1085,15 @@ def build_stealth_df(df_pool, options_map):
     return df
 
 
+def _safe_telegram_text(text):
+    return (text or "").replace("_", " ").replace("*", "´")
+
+
 def _format_sentiment_tags(row):
     tags = []
     if row.get("AnalystBuy"):
         up = row.get("TargetUpside")
-        tags.append(f"Buy +{up:.0f}%" if up is not None else "Buy")
-    np_ = row.get("NewsPct")
-    if np_ is not None:
-        tags.append(f"📰 News:+{np_:.0f}")
-    elif row.get("NewsScore") is not None:
-        tags.append(f"📰 News:{row['NewsScore']:.2f}")
-    if row.get("NegativeFdaNews"):
-        tags.append("📰 News négatives FDA")
-    sp = row.get("SocialPct")
-    if sp is not None:
-        tags.append(f"🐦 Social:+{sp:.0f}")
+        tags.append(f"Target +{up:.0f}%" if up is not None else "Buy")
     rb = row.get("RecBuyPct")
     if rb is not None:
         tags.append(f"FH:{rb:.0f}%Buy")
@@ -943,12 +1101,22 @@ def _format_sentiment_tags(row):
 
 
 def _format_stock_line(row, options_map, stealth=False):
+    risk_emoji = row.get("RiskEmoji", "🟠")
+    risk_label = row.get("RiskLabel", "Moyen")
     line = (
         f"*{row['Ticker']}*\n"
         f"_Momentum: {row.get('MomentumScore', 0):.0f} | "
         f"Analystes: {row.get('AnalystScore', 0):.0f} | "
-        f"Options: {row.get('OptionsScore', 0):.0f}_\n"
-        f"_Score global: {row.get('Score', 0):.0f}_\n"
+        f"Options: {row.get('OptionsScore', 0):.0f} | "
+        f"News: {row.get('SentimentScore', 50):.0f}_\n"
+        f"_Score global: {row.get('Score', 0):.0f} | Risque: {risk_emoji} {risk_label}_\n"
+    )
+    catalyst = row.get("Catalyst")
+    if catalyst:
+        line += f"📰 _Catalyseur: {_safe_telegram_text(catalyst)}_\n"
+    elif row.get("NegativeFdaNews"):
+        line += "📰 _Catalyseur: attention news FDA négatives_\n"
+    line += (
         f"{row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | 20j:{row['Var20j']:+.1f}% | "
         f"Vol:{row['VolRatio']:.1f}x | {row['Prix']:.2f}$"
     )
@@ -986,36 +1154,44 @@ def _format_section_by_sector(df, title, options_map, max_n, stealth=False):
     return message + "\n"
 
 
-def format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20d, options_map, etf_data):
+def format_rising_stars_telegram(df_runners, df_stealth, df_x2, df_extended, spy_ret_20d, options_map, etf_data):
     spy_line = f"SPY 20j: {spy_ret_20d:+.1f}%" if spy_ret_20d is not None else ""
     fh_note = "Finnhub ✅" if FINNHUB_API_KEY else "Finnhub off"
     message = (
-        f"🚀 *AnisTrade — RISING STARS v6*\n"
-        f"_{spy_line} | Cap ≥{RUNNER_MIN_MARKET_CAP // 1_000_000}M$ | "
-        f"Runners: Vol≥{RUNNER_STRICT_VOL_RATIO}x & jour>0 | {fh_note}_\n\n"
+        f"🚀 *AnisTrade — RISING STARS v7*\n"
+        f"_{spy_line} | Cap ≥{RUNNER_MIN_MARKET_CAP // 1_000_000}M$ | {fh_note}_\n\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"📈 *ACTIONS*\n\n"
+        f"⚡ *SWING 1-4 SEMAINES*\n"
     )
-
-    message += format_etf_section(etf_data, spy_ret_20d)
 
     message += _format_section_by_sector(
         df_runners,
-        f"🌟 *RUNNERS* _(volume + momentum jour)_",
+        "🌟 *RUNNERS* _(volume + momentum jour)_",
         options_map, RUNNER_TOP_ALERTS,
     )
     message += _format_section_by_sector(
         df_stealth,
-        f"🕵️ *ACHATS FURTIFS* _(Vol max {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI min {STEALTH_MIN_OPT_VOL_OI}x, jour sup. {STEALTH_MIN_VAR1D:.0f}%)_",
+        f"🕵️ *ACHATS FURTIFS* _(Vol max {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI min {STEALTH_MIN_OPT_VOL_OI}x)_",
         options_map, STEALTH_TOP_ALERTS, stealth=True,
     )
 
+    message += _format_section_by_sector(
+        df_x2,
+        f"🚀 *POTENTIEL x2 — 12 MOIS* _(target ≥{X2_MIN_TARGET_UPSIDE:.0f}% + Buy/FH)_",
+        options_map, X2_TOP_ALERTS,
+    )
+
     if not df_extended.empty:
-        message += f"📈 *DÉJÀ EN RUN* _(>{RUNNER_MAX_VAR20:.0f}% 20j)_\n"
+        message += f"📈 *DÉJÀ EN RUN* _(>{RUNNER_MAX_VAR20:.0f}% 20j — trop tard pour x2)_\n"
         for _, row in df_extended.head(EXTENDED_TOP_ALERTS).iterrows():
             message += f"_{row['Ticker']}_ {row['Var20j']:+.0f}% | {row['Prix']:.0f}$ | Vol:{row['VolRatio']:.1f}x\n"
         message += "\n"
 
-    if df_runners.empty and df_stealth.empty:
-        message += "💤 _Aucun signal fort aujourd'hui._\n"
+    if df_runners.empty and df_stealth.empty and df_x2.empty:
+        message += "💤 _Aucun signal action fort aujourd'hui._\n\n"
+
+    message += format_etf_section(etf_data, spy_ret_20d)
     message += "⚠️ _Pas de garantie +100%. Vérifiez catalyseurs avant trade._"
     return message
 
@@ -1035,7 +1211,7 @@ def main():
     if spy_ret_20d is not None:
         log(f"📊 Benchmark SPY 20j : {spy_ret_20d:+.2f}%")
 
-    df_runners, df_stealth_pool, df_extended = analyze_candidates(tickers, sources, spy_ret_20d)
+    df_runners, df_stealth_pool, df_extended, df_momentum = analyze_candidates(tickers, sources, spy_ret_20d)
 
     options_runners = scan_options_for_df(df_runners, "runners")
     options_stealth = scan_options_for_df(df_stealth_pool, "furtif")
@@ -1044,11 +1220,18 @@ def main():
     df_runners = apply_options_scores(df_runners, options_map)
     df_stealth = build_stealth_df(df_stealth_pool, options_map)
     df_stealth = apply_options_scores(df_stealth, options_map)
-    df_runners, df_stealth, df_extended = enrich_with_finnhub(df_runners, df_stealth, df_extended)
+    df_runners, df_stealth, df_extended, df_momentum = enrich_with_finnhub(
+        df_runners, df_stealth, df_extended, df_momentum,
+    )
+    df_x2 = build_x2_df(df_momentum)
+    options_x2 = scan_options_for_df(df_x2.head(X2_TOP_ALERTS), "x2")
+    options_map = {**options_map, **options_x2}
 
     etf_data = analyze_etf_watchlist(spy_ret_20d)
 
-    message = format_rising_stars_telegram(df_runners, df_stealth, df_extended, spy_ret_20d, options_map, etf_data)
+    message = format_rising_stars_telegram(
+        df_runners, df_stealth, df_x2, df_extended, spy_ret_20d, options_map, etf_data,
+    )
     send_telegram(message)
     log("🚀 Alerte Rising Stars envoyée !")
 
