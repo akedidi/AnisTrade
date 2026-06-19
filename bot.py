@@ -1625,8 +1625,10 @@ def run_poll_once():
     if not TELEGRAM_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN manquant")
     register_bot_commands()
+    data = load_subscribers()
+    log(f"📡 Poll Telegram (offset={data.get('update_offset', 0)})…")
     data = process_telegram_updates(handle_menus=True)
-    log(f"📬 Abonnés enregistrés : {len(data.get('chat_ids', []))}")
+    log(f"📬 Abonnés enregistrés : {len(data.get('chat_ids', []))} (offset={data.get('update_offset', 0)})")
 
 
 if __name__ == "__main__":
