@@ -344,6 +344,10 @@ def process_telegram_updates(handle_menus=False):
         log(f"⚠️ getUpdates : {e}")
         return data
 
+    if not updates:
+        log("📭 Aucun nouveau message Telegram")
+        return data
+
     new_subs = 0
     for update in updates:
         data["update_offset"] = update["update_id"] + 1
@@ -1620,6 +1624,20 @@ def run_bot_polling():
         time.sleep(2)
 
 
+def run_poll_window(seconds=270):
+    """Écoute Telegram en boucle (pour GitHub Actions, ~4m30 toutes les 5 min)."""
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("TELEGRAM_TOKEN manquant")
+    register_bot_commands()
+    data = load_subscribers()
+    log(f"📡 Fenêtre poll {seconds}s (offset={data.get('update_offset', 0)})…")
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        data = process_telegram_updates(handle_menus=True)
+        time.sleep(2)
+    log(f"📬 Fin fenêtre — abonnés : {len(data.get('chat_ids', []))} (offset={data.get('update_offset', 0)})")
+
+
 def run_poll_once():
     """Traite les messages Telegram en attente (sans scan marché)."""
     if not TELEGRAM_TOKEN:
@@ -1637,5 +1655,8 @@ if __name__ == "__main__":
         run_bot_polling()
     elif len(sys.argv) > 1 and sys.argv[1] == "--poll-once":
         run_poll_once()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--poll-window":
+        seconds = int(sys.argv[2]) if len(sys.argv) > 2 else 270
+        run_poll_window(seconds)
     else:
         main()
