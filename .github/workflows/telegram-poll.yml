@@ -2,9 +2,15 @@ name: AnisTrade Telegram Poll
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/telegram-poll.yml'
+      - 'bot.py'
+      - 'subscribers.json'
   schedule:
-    # Répond aux /start et commandes menu en quasi temps réel
-    - cron: '*/3 * * * *'
+    # GitHub Actions : intervalle minimum 5 min (*/3 est ignoré silencieusement)
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
 
 permissions:
   contents: write

@@ -294,9 +294,11 @@ def _handle_start(chat_id, data):
         data["chat_ids"].append(chat_id)
         new = 1
         log(f"📬 Nouvel abonné : {chat_id}")
-    # Retire un ancien clavier reply s'il existait
-    _send_raw_telegram(chat_id, _welcome_message(chat_id), reply_markup={"remove_keyboard": True})
-    send_to_chat(chat_id, MENU_HELP)
+    try:
+        _send_raw_telegram(chat_id, _welcome_message(chat_id), reply_markup={"remove_keyboard": True})
+        send_to_chat(chat_id, MENU_HELP)
+    except Exception as e:
+        log(f"⚠️ Message bienvenue {chat_id}: {e}")
     return new
 
 
@@ -353,7 +355,10 @@ def process_telegram_updates(handle_menus=False):
         cmd = text.split()[0].split("@")[0].lower() if text else ""
 
         if cmd == "/start":
-            new_subs += _handle_start(chat_id, data)
+            try:
+                new_subs += _handle_start(chat_id, data)
+            except Exception as e:
+                log(f"⚠️ /start pour {chat_id}: {e}")
             continue
         if cmd == "/menu":
             send_to_chat(chat_id, MENU_HELP)
@@ -372,10 +377,12 @@ def process_telegram_updates(handle_menus=False):
             except Exception as e:
                 log(f"⚠️ Action commande : {e}")
 
-    if new_subs or updates:
+    if updates:
         save_subscribers(data)
         if new_subs:
             log(f"📬 Abonnés : {len(data['chat_ids'])} (+{new_subs} nouveau(x))")
+        elif not new_subs:
+            log(f"📬 {len(updates)} update(s) traité(s), abonnés : {len(data['chat_ids'])}")
     return data
 
 
