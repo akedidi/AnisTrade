@@ -158,11 +158,15 @@ OPTIONS_DELAY_SEC = 0.25
 OPTIONS_CONTRACTS_PER_TICKER = 2
 
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
-WELCOME_MESSAGE = (
-    "✅ <b>AnisTrade</b> — abonnement confirmé.\n"
-    "Ouvrez le menu du bot (bouton <b>/</b>) pour explorer les signaux.\n"
-    "Les <b>Highlights</b> automatiques sont envoyés à chaque alerte planifiée."
-)
+
+
+def _welcome_message(chat_id):
+    return (
+        "✅ <b>AnisTrade</b> — abonnement confirmé.\n"
+        f"🆔 Votre <b>chat_id</b> : <code>{escape_html(chat_id)}</code>\n\n"
+        "Ouvrez le menu du bot (bouton <b>/</b>) pour explorer les signaux.\n"
+        "Les <b>Highlights</b> automatiques sont envoyés à chaque alerte planifiée."
+    )
 SCAN_CACHE_TTL_SEC = 900
 _scan_cache = {"ts": 0, "data": None}
 
@@ -245,10 +249,27 @@ def _send_raw_telegram(chat_id, text, parse_mode="HTML", reply_markup=None):
     return True
 
 
+def ensure_telegram_polling():
+    """Supprime un éventuel webhook (sinon getUpdates ne reçoit rien)."""
+    if not TELEGRAM_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook"
+    try:
+        resp = requests.post(url, json={"drop_pending_updates": False}, timeout=15)
+        ok, err = _telegram_post_ok(resp)
+        if ok:
+            log("🔗 Mode polling actif (webhook supprimé)")
+        else:
+            log(f"⚠️ deleteWebhook : {err}")
+    except Exception as e:
+        log(f"⚠️ deleteWebhook : {e}")
+
+
 def register_bot_commands():
     """Enregistre le menu de commandes dans le bot Telegram (pas de clavier canal)."""
     if not TELEGRAM_TOKEN:
         return
+    ensure_telegram_polling()
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
     try:
         resp = requests.post(url, json={"commands": BOT_COMMANDS}, timeout=15)
@@ -274,7 +295,8 @@ def _handle_start(chat_id, data):
         new = 1
         log(f"📬 Nouvel abonné : {chat_id}")
     # Retire un ancien clavier reply s'il existait
-    _send_raw_telegram(chat_id, WELCOME_MESSAGE, reply_markup={"remove_keyboard": True})
+    _send_raw_telegram(chat_id, _welcome_message(chat_id), reply_markup={"remove_keyboard": True})
+    send_to_chat(chat_id, MENU_HELP)
     return new
 
 
@@ -304,6 +326,7 @@ def process_telegram_updates(handle_menus=False):
     if not TELEGRAM_TOKEN:
         return load_subscribers()
 
+    ensure_telegram_polling()
     data = load_subscribers()
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     params = {"offset": data.get("update_offset", 0), "timeout": 0, "allowed_updates": ["message"]}
@@ -1590,9 +1613,20 @@ def run_bot_polling():
         time.sleep(2)
 
 
+def run_poll_once():
+    """Traite les messages Telegram en attente (sans scan marché)."""
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("TELEGRAM_TOKEN manquant")
+    register_bot_commands()
+    data = process_telegram_updates(handle_menus=True)
+    log(f"📬 Abonnés enregistrés : {len(data.get('chat_ids', []))}")
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] in ("--poll-subscribers", "--bot"):
         run_bot_polling()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--poll-once":
+        run_poll_once()
     else:
         main()
