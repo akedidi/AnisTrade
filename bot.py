@@ -21,7 +21,7 @@ OTHER_EXCHANGES = {"N", "A", "P", "Z"}
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
-USER_AGENT = "AnisTradeBot/7.0 (rising-stars)"
+USER_AGENT = "AnisTradeBot/8.0 (highlights)"
 
 US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "PCX", "BTS", "ASE"}
 
@@ -45,10 +45,9 @@ RUNNER_STRICT_VOL_RATIO = 1.5
 ANALYST_TARGET_MIN_UPSIDE = 30.0
 BUY_RATINGS = {"buy", "strong_buy", "strongbuy", "outperform", "overweight"}
 RUNNER_MAX_DOWNLOAD = 120
-RUNNER_TOP_ALERTS = 15
-STEALTH_TOP_ALERTS = 10
-X2_TOP_ALERTS = 8
-EXTENDED_TOP_ALERTS = 5
+HIGHLIGHT_MAX_STOCKS = 4
+HIGHLIGHT_MAX_ETFS = 2
+STEALTH_SCAN_CAP = 12
 EXTENDED_MIN_PRICE = 3.0
 
 STEALTH_MAX_VOL_RATIO = 1.5
@@ -961,39 +960,6 @@ def analyze_etf_watchlist(spy_ret_20d):
     return results
 
 
-def format_etf_section(etf_data, spy_ret_20d):
-    if not etf_data:
-        return ""
-    message = "━━━━━━━━━━━━━━━━\n"
-    message += "<b>📊 ETF — LONG TERME</b>\n"
-    if spy_ret_20d is not None:
-        message += f"<i>PEA / CTO — croissance et thématiques (vs SPY 20j: {spy_ret_20d:+.1f}%)</i>\n\n"
-    else:
-        message += "<i>PEA / CTO — croissance et thématiques</i>\n\n"
-
-    best_ticker, best_rs = None, None
-    for group in ("CROISSANCE", "IA", "SEMI"):
-        for row in etf_data.get(group, []):
-            rs = row.get("RS20j", 0)
-            if best_rs is None or rs > best_rs:
-                best_rs, best_ticker = rs, row["Ticker"]
-
-    for group in ("CROISSANCE", "IA", "SEMI"):
-        rows = etf_data.get(group, [])
-        if not rows:
-            continue
-        message += f"<b>{ETF_GROUP_LABELS[group]}</b>\n"
-        for row in rows:
-            star = " ⭐" if row["Ticker"] == best_ticker else ""
-            rs = f" | RS:{row['RS20j']:+.1f}%" if row.get("RS20j") is not None else ""
-            message += (
-                f"<i>{row['Ticker']}</i>{star} {row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | "
-                f"20j:{row['Var20j']:+.1f}%{rs} | {row['Prix']:.2f}$\n"
-            )
-        message += "\n"
-    return message
-
-
 def apply_options_scores(df, options_map):
     if df.empty:
         return df
@@ -1106,111 +1072,106 @@ def build_stealth_df(df_pool, options_map):
     return df
 
 
-def _format_sentiment_tags(row):
-    tags = []
-    if row.get("AnalystBuy"):
-        up = row.get("TargetUpside")
-        tags.append(f"Target +{up:.0f}%" if up is not None else "Buy")
-    rb = row.get("RecBuyPct")
-    if rb is not None:
-        tags.append(f"FH:{rb:.0f}%Buy")
-    return " | <i>" + ", ".join(escape_html(t) for t in tags) + "</i>" if tags else ""
+def build_stock_highlights(df_runners, df_stealth, df_x2):
+    """Top actions uniques — max HIGHLIGHT_MAX_STOCKS."""
+    best = {}
+    for signal, df in (("runner", df_runners), ("furtif", df_stealth), ("x2", df_x2)):
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            r = row.to_dict()
+            r["Signal"] = signal
+            ticker = r["Ticker"]
+            if ticker not in best or r.get("Score", 0) > best[ticker].get("Score", 0):
+                best[ticker] = r
+    ranked = sorted(best.values(), key=lambda x: x.get("Score", 0), reverse=True)
+    return ranked[:HIGHLIGHT_MAX_STOCKS]
 
 
-def _format_stock_line(row, options_map, stealth=False):
-    risk_emoji = row.get("RiskEmoji", "🟠")
-    risk_label = escape_html(row.get("RiskLabel", "Moyen"))
+def pick_etf_highlights(etf_data):
+    """Top ETF par RS 20j — max HIGHLIGHT_MAX_ETFS."""
+    rows = []
+    for group, items in (etf_data or {}).items():
+        for row in items:
+            r = dict(row)
+            r["Group"] = group
+            rows.append(r)
+    rows.sort(key=lambda x: x.get("RS20j", 0), reverse=True)
+    return rows[:HIGHLIGHT_MAX_ETFS]
+
+
+def _safe_num(val, default=0):
+    if val is None:
+        return default
+    try:
+        if pd.isna(val):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return val
+
+
+def _format_highlight_stock(row, options_map):
     ticker = escape_html(row["Ticker"])
-    line = (
-        f"<b>{ticker}</b>\n"
-        f"<i>Momentum: {row.get('MomentumScore', 0):.0f} | "
-        f"Analystes: {row.get('AnalystScore', 0):.0f} | "
-        f"Options: {row.get('OptionsScore', 0):.0f} | "
-        f"News: {row.get('SentimentScore', 50):.0f}</i>\n"
-        f"<i>Score global: {row.get('Score', 0):.0f} | Risque: {risk_emoji} {risk_label}</i>\n"
-    )
-    catalyst = row.get("Catalyst")
-    if catalyst:
-        line += f"📰 <i>Catalyseur: {escape_html(catalyst)}</i>\n"
-    elif row.get("NegativeFdaNews"):
-        line += "📰 <i>Catalyseur: attention news FDA négatives</i>\n"
-    line += (
-        f"{row['Var1j']:+.1f}% | 5j:{row['Var5j']:+.1f}% | 20j:{row['Var20j']:+.1f}% | "
-        f"Vol:{row['VolRatio']:.1f}x | {row['Prix']:.2f}$"
-    )
-    if row.get("Shorted"):
-        line += " | <i>short</i>"
-    line += _format_sentiment_tags(row) + "\n"
+    risk = row.get("RiskEmoji", "🟠")
+    score = int(_safe_num(row.get("Score"), 0))
+    parts = [f"<b>{ticker}</b>", f"Score {score} {risk}", f"20j {_safe_num(row['Var20j']):+.0f}%"]
+
+    rb = row.get("RecBuyPct")
+    up = row.get("TargetUpside")
+    if rb is not None:
+        parts.append(f"FH {rb:.0f}%")
+    elif up is not None:
+        parts.append(f"Target +{up:.0f}%")
+
+    news = row.get("SentimentScore")
+    if news is not None and news != 50:
+        parts.append(f"News {news:.0f}")
 
     contracts = options_map.get(row["Ticker"])
     if contracts:
-        c = contracts[0]
-        prefix = "🕵️" if stealth else "🐳"
-        line += (
-            f"   {prefix} CALL {c['strike']:.1f} OTM +{c['otm_pct']:.0f}% {short_expiry(c['expiry'])} | "
-            f"Vol:{c['volume']:,} &gt; OI:{c['oi']:,} | {c['vol_oi']:.1f}x\n"
-        )
-    return line
+        icon = "🕵️" if row.get("Signal") == "furtif" else "🐳"
+        parts.append(f"{icon} {contracts[0]['vol_oi']:.1f}x")
+
+    line = " | ".join(parts)
+    catalyst = row.get("Catalyst")
+    if catalyst:
+        line += f"\n📰 {escape_html(str(catalyst)[:55])}"
+    return line + "\n"
 
 
-def _format_section_by_sector(df, title, options_map, max_n, stealth=False):
-    if df.empty:
-        return f"{title}\n<i>Rien aujourd'hui — gardez votre cash.</i>\n\n"
-    message = f"{title}\n"
-    subset = df.head(max_n)
-    grouped = {cat: [] for cat in SECTOR_ORDER}
-    for _, row in subset.iterrows():
-        cat = row.get("Category", "Autre")
-        grouped.setdefault(cat, []).append(row)
-    for cat in SECTOR_ORDER:
-        rows = grouped.get(cat, [])
-        if not rows:
-            continue
-        message += f"\n<b>{SECTOR_LABELS[cat]}</b>\n"
-        for row in rows:
-            message += _format_stock_line(row, options_map, stealth=stealth)
-    return message + "\n"
+def _format_highlight_etf(row, best=False):
+    star = " ⭐" if best else ""
+    return (
+        f"<b>{escape_html(row['Ticker'])}</b>{star} "
+        f"20j {row['Var20j']:+.1f}% | RS {row.get('RS20j', 0):+.1f}% | {row['Prix']:.0f}$\n"
+    )
 
 
-def format_rising_stars_telegram(df_runners, df_stealth, df_x2, df_extended, spy_ret_20d, options_map, etf_data):
-    spy_line = f"SPY 20j: {spy_ret_20d:+.1f}%" if spy_ret_20d is not None else ""
-    fh_note = "Finnhub ✅" if FINNHUB_API_KEY else "Finnhub off"
+def format_highlights_telegram(stock_highlights, etf_highlights, spy_ret_20d, options_map):
+    spy = ""
+    if spy_ret_20d is not None and not (isinstance(spy_ret_20d, float) and pd.isna(spy_ret_20d)):
+        spy = f"SPY 20j: {spy_ret_20d:+.1f}%"
+    fh = "Finnhub ✅" if FINNHUB_API_KEY else "Finnhub off"
     message = (
-        f"🚀 <b>AnisTrade — RISING STARS v7</b>\n"
-        f"<i>{escape_html(spy_line)} | Cap &gt;= {RUNNER_MIN_MARKET_CAP // 1_000_000}M$ | {fh_note}</i>\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"<b>📈 ACTIONS</b>\n\n"
-        f"<b>⚡ SWING 1-4 SEMAINES</b>\n"
+        f"🚀 <b>AnisTrade — Highlights</b>\n"
+        f"<i>{escape_html(spy)} | {fh}</i>\n\n"
+        f"<b>📈 ACTIONS</b> <i>(top {HIGHLIGHT_MAX_STOCKS})</i>\n"
     )
+    if stock_highlights:
+        for row in stock_highlights:
+            message += _format_highlight_stock(row, options_map)
+    else:
+        message += "<i>Rien de convaincant aujourd'hui.</i>\n"
 
-    message += _format_section_by_sector(
-        df_runners,
-        "<b>🌟 RUNNERS</b> <i>(volume + momentum jour)</i>",
-        options_map, RUNNER_TOP_ALERTS,
-    )
-    message += _format_section_by_sector(
-        df_stealth,
-        f"<b>🕵️ ACHATS FURTIFS</b> <i>(Vol max {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI min {STEALTH_MIN_OPT_VOL_OI}x)</i>",
-        options_map, STEALTH_TOP_ALERTS, stealth=True,
-    )
+    message += f"\n<b>📊 ETF</b> <i>(top {HIGHLIGHT_MAX_ETFS})</i>\n"
+    if etf_highlights:
+        for i, row in enumerate(etf_highlights):
+            message += _format_highlight_etf(row, best=(i == 0))
+    else:
+        message += "<i>N/A</i>\n"
 
-    message += _format_section_by_sector(
-        df_x2,
-        f"<b>🚀 POTENTIEL x2 — 12 MOIS</b> <i>(target &gt;= {X2_MIN_TARGET_UPSIDE:.0f}% + Buy/FH)</i>",
-        options_map, X2_TOP_ALERTS,
-    )
-
-    if not df_extended.empty:
-        message += f"<b>📈 DÉJÀ EN RUN</b> <i>(&gt;{RUNNER_MAX_VAR20:.0f}% 20j — trop tard pour x2)</i>\n"
-        for _, row in df_extended.head(EXTENDED_TOP_ALERTS).iterrows():
-            message += f"<i>{row['Ticker']}</i> {row['Var20j']:+.0f}% | {row['Prix']:.0f}$ | Vol:{row['VolRatio']:.1f}x\n"
-        message += "\n"
-
-    if df_runners.empty and df_stealth.empty and df_x2.empty:
-        message += "💤 <i>Aucun signal action fort aujourd'hui.</i>\n\n"
-
-    message += format_etf_section(etf_data, spy_ret_20d)
-    message += "⚠️ <i>Pas de garantie +100%. Vérifiez catalyseurs avant trade.</i>"
+    message += "\n⚠️ <i>Pas un conseil d'investissement.</i>"
     return message
 
 
@@ -1231,25 +1192,30 @@ def main():
 
     df_runners, df_stealth_pool, df_extended, df_momentum = analyze_candidates(tickers, sources, spy_ret_20d)
 
+    stealth_scan = df_stealth_pool.head(STEALTH_SCAN_CAP) if not df_stealth_pool.empty else df_stealth_pool
     options_runners = scan_options_for_df(df_runners, "runners")
-    options_stealth = scan_options_for_df(df_stealth_pool, "furtif")
+    options_stealth = scan_options_for_df(stealth_scan, "furtif")
     options_map = {**options_runners, **options_stealth}
 
     df_runners = apply_options_scores(df_runners, options_map)
-    df_stealth = build_stealth_df(df_stealth_pool, options_map)
+    df_stealth = build_stealth_df(stealth_scan, options_map)
     df_stealth = apply_options_scores(df_stealth, options_map)
-    df_runners, df_stealth, df_extended, df_momentum = enrich_with_finnhub(
-        df_runners, df_stealth, df_extended, df_momentum,
-    )
     df_x2 = build_x2_df(df_momentum)
-    options_x2 = scan_options_for_df(df_x2.head(X2_TOP_ALERTS), "x2")
-    options_map = {**options_map, **options_x2}
+    df_runners, df_stealth, _, df_x2 = enrich_with_finnhub(
+        df_runners, df_stealth, pd.DataFrame(), df_x2,
+    )
+
+    stock_highlights = build_stock_highlights(df_runners, df_stealth, df_x2)
+    missing = [r for r in stock_highlights if r["Ticker"] not in options_map]
+    if missing:
+        df_missing = pd.DataFrame(missing)
+        options_map = {**options_map, **scan_options_for_df(df_missing, "highlights")}
 
     etf_data = analyze_etf_watchlist(spy_ret_20d)
+    etf_highlights = pick_etf_highlights(etf_data)
 
-    message = format_rising_stars_telegram(
-        df_runners, df_stealth, df_x2, df_extended, spy_ret_20d, options_map, etf_data,
-    )
+    log(f"✨ Highlights : {len(stock_highlights)} actions + {len(etf_highlights)} ETF")
+    message = format_highlights_telegram(stock_highlights, etf_highlights, spy_ret_20d, options_map)
     log(f"📨 Message Telegram : {len(message)} caractères")
     send_telegram(message)
     log("🚀 Alerte Rising Stars envoyée !")
