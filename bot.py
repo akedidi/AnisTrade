@@ -22,7 +22,7 @@ OTHER_EXCHANGES = {"N", "A", "P", "Z"}
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
-USER_AGENT = "AnisTradeBot/8.0 (highlights)"
+USER_AGENT = "AnisTradeBot/9.0 (highlights-menu)"
 
 US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "PCX", "BTS", "ASE"}
 
@@ -50,6 +50,31 @@ HIGHLIGHT_MAX_STOCKS = 4
 HIGHLIGHT_MAX_ETFS = 2
 STEALTH_SCAN_CAP = 12
 EXTENDED_MIN_PRICE = 3.0
+
+MENU_MAX_PER_SECTOR = 3
+MENU_MAX_ETF = 3
+MENU_MAX_RUNNERS = 8
+MENU_MAX_STEALTH = 8
+MENU_MAX_EXTENDED = 5
+
+MENU_LABELS = {
+    "highlights": "✨ Highlights",
+    "actions": "📈 Actions",
+    "etfs": "📊 ETFs",
+    "runners": "🌟 Runners",
+    "furtifs": "🕵️ Furtifs",
+    "extended": "📈 Déjà en run",
+}
+MENU_BY_TEXT = {v: k for k, v in MENU_LABELS.items()}
+
+MENU_KEYBOARD = {
+    "keyboard": [
+        [MENU_LABELS["highlights"], MENU_LABELS["actions"]],
+        [MENU_LABELS["etfs"], MENU_LABELS["runners"]],
+        [MENU_LABELS["furtifs"], MENU_LABELS["extended"]],
+    ],
+    "resize_keyboard": True,
+}
 
 STEALTH_MAX_VOL_RATIO = 1.5
 STEALTH_MIN_OPT_VOL_OI = 5.0
@@ -114,8 +139,11 @@ OPTIONS_CONTRACTS_PER_TICKER = 2
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
 WELCOME_MESSAGE = (
     "✅ <b>AnisTrade</b> — abonnement confirmé.\n"
-    "Vous recevrez les alertes <b>Highlights</b> (actions + ETF)."
+    "Utilisez le menu ci-dessous pour explorer les signaux.\n"
+    "Les <b>Highlights</b> automatiques sont envoyés à chaque alerte planifiée."
 )
+SCAN_CACHE_TTL_SEC = 900
+_scan_cache = {"ts": 0, "data": None}
 
 
 def to_yahoo_symbol(symbol: str) -> str:
@@ -178,7 +206,7 @@ def get_subscriber_chat_ids():
     return load_subscribers().get("chat_ids", [])
 
 
-def _send_raw_telegram(chat_id, text, parse_mode="HTML"):
+def _send_raw_telegram(chat_id, text, parse_mode="HTML", reply_markup=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -187,6 +215,8 @@ def _send_raw_telegram(chat_id, text, parse_mode="HTML"):
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     resp = requests.post(url, json=payload, timeout=30)
     ok, err = _telegram_post_ok(resp)
     if not ok:
@@ -194,8 +224,48 @@ def _send_raw_telegram(chat_id, text, parse_mode="HTML"):
     return True
 
 
-def process_telegram_updates():
-    """Traite les /start en attente et enregistre les chat_id dans subscribers.json."""
+def send_with_menu(chat_id, text):
+    """Envoie un message avec le clavier menu à un seul chat."""
+    chunks = _split_telegram_message(text)
+    for i, chunk in enumerate(chunks):
+        markup = MENU_KEYBOARD if i == len(chunks) - 1 else None
+        _send_raw_telegram(chat_id, chunk, reply_markup=markup)
+
+
+def _handle_start(chat_id, data):
+    new = 0
+    if chat_id not in data["chat_ids"]:
+        data["chat_ids"].append(chat_id)
+        new = 1
+        log(f"📬 Nouvel abonné : {chat_id}")
+    send_with_menu(chat_id, WELCOME_MESSAGE)
+    return new
+
+
+def _handle_menu_action(chat_id, action_key):
+    log(f"📲 Menu '{action_key}' demandé par {chat_id}")
+    send_with_menu(chat_id, "⏳ <i>Analyse en cours…</i>")
+    try:
+        scan = get_scan_data(force=True)
+        formatters = {
+            "highlights": lambda: format_highlights_telegram(
+                scan["stock_highlights"], scan["etf_highlights"], scan["spy_ret_20d"], scan["options_map"],
+            ),
+            "actions": lambda: format_actions_telegram(scan["df_momentum"], scan["options_map"], scan["spy_ret_20d"]),
+            "etfs": lambda: format_etfs_telegram(scan["etf_data"], scan["spy_ret_20d"]),
+            "runners": lambda: format_runners_telegram(scan["df_runners"], scan["options_map"], scan["spy_ret_20d"]),
+            "furtifs": lambda: format_furtifs_telegram(scan["df_stealth"], scan["options_map"], scan["spy_ret_20d"]),
+            "extended": lambda: format_extended_telegram(scan["df_extended"], scan["spy_ret_20d"]),
+        }
+        message = formatters[action_key]()
+        send_with_menu(chat_id, message)
+    except Exception as e:
+        log(f"⚠️ Menu {action_key} pour {chat_id}: {e}")
+        send_with_menu(chat_id, f"⚠️ Erreur : {escape_html(str(e)[:200])}")
+
+
+def process_telegram_updates(handle_menus=False):
+    """Traite /start, abonnements et (optionnel) le menu interactif."""
     if not TELEGRAM_TOKEN:
         return load_subscribers()
 
@@ -221,22 +291,33 @@ def process_telegram_updates():
         if not message:
             continue
         text = (message.get("text") or "").strip()
-        cmd = text.split()[0].split("@")[0].lower() if text else ""
-        if cmd != "/start":
-            continue
         chat_id = str(message["chat"]["id"])
-        if chat_id not in data["chat_ids"]:
-            data["chat_ids"].append(chat_id)
-            new_subs += 1
-            log(f"📬 Nouvel abonné : {chat_id}")
-        try:
-            _send_raw_telegram(chat_id, WELCOME_MESSAGE)
-        except Exception as e:
-            log(f"⚠️ Message bienvenue {chat_id}: {e}")
+        cmd = text.split()[0].split("@")[0].lower() if text else ""
+
+        if cmd == "/start":
+            new_subs += _handle_start(chat_id, data)
+            continue
+        if cmd == "/menu":
+            send_with_menu(chat_id, "📋 <b>Menu AnisTrade</b> — choisissez une section :")
+            continue
+
+        if not handle_menus:
+            continue
+
+        action_key = MENU_BY_TEXT.get(text)
+        if action_key:
+            if chat_id not in data["chat_ids"]:
+                data["chat_ids"].append(chat_id)
+                new_subs += 1
+            try:
+                _handle_menu_action(chat_id, action_key)
+            except Exception as e:
+                log(f"⚠️ Action menu : {e}")
 
     if new_subs or updates:
         save_subscribers(data)
-        log(f"📬 Abonnés : {len(data['chat_ids'])} (+{new_subs} nouveau(x))")
+        if new_subs:
+            log(f"📬 Abonnés : {len(data['chat_ids'])} (+{new_subs} nouveau(x))")
     return data
 
 
@@ -1225,6 +1306,166 @@ def _safe_num(val, default=0):
     return val
 
 
+def _format_compact_stock(row, options_map=None, stealth=False):
+    """Une ligne compacte — ticker en gras."""
+    ticker = escape_html(row["Ticker"])
+    score = int(_safe_num(row.get("Score"), 0))
+    risk = row.get("RiskEmoji", "🟠")
+    parts = [f"<b>{ticker}</b>", f"{score}{risk}", f"20j {_safe_num(row['Var20j']):+.0f}%"]
+    rb = row.get("RecBuyPct")
+    up = row.get("TargetUpside")
+    if rb is not None and not pd.isna(rb):
+        parts.append(f"FH {rb:.0f}%")
+    elif up is not None and not pd.isna(up):
+        parts.append(f"Tgt +{up:.0f}%")
+    if options_map:
+        contracts = options_map.get(row["Ticker"])
+        if contracts:
+            icon = "🕵️" if stealth else "🐳"
+            parts.append(f"{icon}{contracts[0]['vol_oi']:.1f}x")
+    return " | ".join(parts) + "\n"
+
+
+def _spy_header(spy_ret_20d):
+    if spy_ret_20d is not None and not (isinstance(spy_ret_20d, float) and pd.isna(spy_ret_20d)):
+        return f"<i>SPY 20j: {spy_ret_20d:+.1f}%</i>\n"
+    return ""
+
+
+def format_actions_telegram(df_momentum, options_map, spy_ret_20d):
+    message = f"<b>{MENU_LABELS['actions']}</b>\n{_spy_header(spy_ret_20d)}"
+    if df_momentum is None or df_momentum.empty:
+        return message + "<i>Aucune action qualifiée.</i>\n"
+    df = df_momentum.sort_values(by=["Score", "Var20j"], ascending=False)
+    grouped = {cat: [] for cat in SECTOR_ORDER}
+    for _, row in df.iterrows():
+        grouped.setdefault(row.get("Category", "Autre"), []).append(row)
+    for cat in SECTOR_ORDER:
+        rows = grouped.get(cat, [])[:MENU_MAX_PER_SECTOR]
+        if not rows:
+            continue
+        message += f"\n<b>{SECTOR_LABELS[cat]}</b>\n"
+        for row in rows:
+            message += _format_compact_stock(row, options_map)
+    return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+
+
+def format_etfs_telegram(etf_data, spy_ret_20d):
+    message = f"<b>{MENU_LABELS['etfs']}</b>\n{_spy_header(spy_ret_20d)}"
+    if not etf_data:
+        return message + "<i>N/A</i>\n"
+    for group in ("CROISSANCE", "IA", "SEMI"):
+        rows = (etf_data.get(group) or [])[:MENU_MAX_ETF]
+        if not rows:
+            continue
+        message += f"\n<b>{ETF_GROUP_LABELS[group]}</b>\n"
+        for row in rows:
+            message += _format_highlight_etf(row)
+    return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+
+
+def format_runners_telegram(df_runners, options_map, spy_ret_20d):
+    message = f"<b>{MENU_LABELS['runners']}</b>\n{_spy_header(spy_ret_20d)}"
+    message += f"<i>Vol &gt;= {RUNNER_STRICT_VOL_RATIO}x et jour vert</i>\n"
+    if df_runners is None or df_runners.empty:
+        return message + "<i>Aucun runner aujourd'hui.</i>\n"
+    for _, row in df_runners.head(MENU_MAX_RUNNERS).iterrows():
+        message += _format_compact_stock(row, options_map)
+    return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+
+
+def format_furtifs_telegram(df_stealth, options_map, spy_ret_20d):
+    message = f"<b>🕵️ ACHATS FURTIFS</b>\n{_spy_header(spy_ret_20d)}"
+    message += f"<i>Vol &lt; {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI &gt;= {STEALTH_MIN_OPT_VOL_OI}x</i>\n"
+    if df_stealth is None or df_stealth.empty:
+        return message + "<i>Aucun signal furtif.</i>\n"
+    for _, row in df_stealth.head(MENU_MAX_STEALTH).iterrows():
+        message += _format_compact_stock(row, options_map, stealth=True)
+    return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+
+
+def format_extended_telegram(df_extended, spy_ret_20d):
+    message = f"<b>📈 DÉJÀ EN RUN</b>\n{_spy_header(spy_ret_20d)}"
+    message += f"<i>&gt; {RUNNER_MAX_VAR20:.0f}% sur 20j — trop tard pour x2</i>\n"
+    if df_extended is None or df_extended.empty:
+        return message + "<i>Aucune action étirée.</i>\n"
+    for _, row in df_extended.head(MENU_MAX_EXTENDED).iterrows():
+        message += (
+            f"<b>{escape_html(row['Ticker'])}</b> "
+            f"{row['Var20j']:+.0f}% | {row['Prix']:.0f}$ | Vol {row['VolRatio']:.1f}x\n"
+        )
+    return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+
+
+def run_market_scan():
+    """Pipeline complet — données pour tous les menus."""
+    nasdaq_stocks, _ = fetch_nasdaq_trader_symbols()
+    stock_quotes, sources = fetch_screener_universe()
+    tickers = build_runner_candidates(stock_quotes, nasdaq_stocks, sources)
+    if not tickers:
+        raise RuntimeError("Aucun candidat screener.")
+
+    spy_ret_20d = get_spy_benchmark()
+    if spy_ret_20d is not None:
+        log(f"📊 Benchmark SPY 20j : {spy_ret_20d:+.2f}%")
+
+    df_runners, df_stealth_pool, df_extended, df_momentum = analyze_candidates(tickers, sources, spy_ret_20d)
+
+    stealth_scan = df_stealth_pool.head(STEALTH_SCAN_CAP) if not df_stealth_pool.empty else df_stealth_pool
+    options_runners = scan_options_for_df(df_runners, "runners")
+    options_stealth = scan_options_for_df(stealth_scan, "furtif")
+    options_map = {**options_runners, **options_stealth}
+
+    df_runners = apply_options_scores(df_runners, options_map)
+    df_stealth = build_stealth_df(stealth_scan, options_map)
+    df_stealth = apply_options_scores(df_stealth, options_map)
+
+    df_runners, df_stealth, df_extended, df_momentum = enrich_with_finnhub(
+        df_runners, df_stealth, df_extended, df_momentum,
+    )
+    df_x2 = build_x2_df(df_momentum)
+
+    stock_highlights = build_stock_highlights(df_runners, df_stealth, df_x2)
+    for row in stock_highlights:
+        if row["Ticker"] not in options_map:
+            extra = scan_options_for_df(pd.DataFrame([row]), "highlights")
+            options_map.update(extra)
+
+    etf_data = analyze_etf_watchlist(spy_ret_20d)
+    etf_highlights = pick_etf_highlights(etf_data)
+
+    log(
+        f"✨ Scan : {len(stock_highlights)} highlights | "
+        f"{len(df_runners)} runners | {len(df_stealth)} furtifs | {len(df_extended)} étirés"
+    )
+    return {
+        "spy_ret_20d": spy_ret_20d,
+        "df_runners": df_runners,
+        "df_stealth": df_stealth,
+        "df_extended": df_extended,
+        "df_momentum": df_momentum,
+        "df_x2": df_x2,
+        "options_map": options_map,
+        "etf_data": etf_data,
+        "stock_highlights": stock_highlights,
+        "etf_highlights": etf_highlights,
+    }
+
+
+def get_scan_data(force=False):
+    global _scan_cache
+    if (
+        not force
+        and _scan_cache["data"] is not None
+        and time.time() - _scan_cache["ts"] < SCAN_CACHE_TTL_SEC
+    ):
+        log("📦 Scan en cache (réutilisé)")
+        return _scan_cache["data"]
+    data = run_market_scan()
+    _scan_cache = {"ts": time.time(), "data": data}
+    return data
+
+
 def _format_highlight_stock(row, options_map):
     ticker = escape_html(row["Ticker"])
     risk = row.get("RiskEmoji", "🟠")
@@ -1288,62 +1529,33 @@ def main():
     if not TELEGRAM_TOKEN:
         raise Exception("Secret TELEGRAM_TOKEN manquant. Vérifiez vos Secrets GitHub.")
 
-    process_telegram_updates()
+    process_telegram_updates(handle_menus=True)
     if not get_subscriber_chat_ids():
         raise Exception(
             "Aucun abonné Telegram. Envoyez /start au bot ou définissez TELEGRAM_CHAT_ID."
         )
 
-    nasdaq_stocks, _ = fetch_nasdaq_trader_symbols()
-    stock_quotes, sources = fetch_screener_universe()
-    tickers = build_runner_candidates(stock_quotes, nasdaq_stocks, sources)
-    if not tickers:
-        log("Aucun candidat screener. Fin.")
-        return
-
-    spy_ret_20d = get_spy_benchmark()
-    if spy_ret_20d is not None:
-        log(f"📊 Benchmark SPY 20j : {spy_ret_20d:+.2f}%")
-
-    df_runners, df_stealth_pool, df_extended, df_momentum = analyze_candidates(tickers, sources, spy_ret_20d)
-
-    stealth_scan = df_stealth_pool.head(STEALTH_SCAN_CAP) if not df_stealth_pool.empty else df_stealth_pool
-    options_runners = scan_options_for_df(df_runners, "runners")
-    options_stealth = scan_options_for_df(stealth_scan, "furtif")
-    options_map = {**options_runners, **options_stealth}
-
-    df_runners = apply_options_scores(df_runners, options_map)
-    df_stealth = build_stealth_df(stealth_scan, options_map)
-    df_stealth = apply_options_scores(df_stealth, options_map)
-    df_x2 = build_x2_df(df_momentum)
-    df_runners, df_stealth, _, df_x2 = enrich_with_finnhub(
-        df_runners, df_stealth, pd.DataFrame(), df_x2,
+    scan = run_market_scan()
+    message = format_highlights_telegram(
+        scan["stock_highlights"], scan["etf_highlights"], scan["spy_ret_20d"], scan["options_map"],
     )
-
-    stock_highlights = build_stock_highlights(df_runners, df_stealth, df_x2)
-    missing = [r for r in stock_highlights if r["Ticker"] not in options_map]
-    if missing:
-        df_missing = pd.DataFrame(missing)
-        options_map = {**options_map, **scan_options_for_df(df_missing, "highlights")}
-
-    etf_data = analyze_etf_watchlist(spy_ret_20d)
-    etf_highlights = pick_etf_highlights(etf_data)
-
-    log(f"✨ Highlights : {len(stock_highlights)} actions + {len(etf_highlights)} ETF")
-    message = format_highlights_telegram(stock_highlights, etf_highlights, spy_ret_20d, options_map)
-    log(f"📨 Message Telegram : {len(message)} caractères")
+    log(f"📨 Message Highlights : {len(message)} caractères → tous les abonnés")
     send_telegram(message)
-    log("🚀 Alerte Rising Stars envoyée !")
+    log("🚀 Alerte Highlights envoyée !")
+
+
+def run_bot_polling():
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("TELEGRAM_TOKEN manquant")
+    log("🤖 Bot AnisTrade — menu interactif (Ctrl+C pour arrêter)")
+    while True:
+        process_telegram_updates(handle_menus=True)
+        time.sleep(2)
 
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--poll-subscribers":
-        if not TELEGRAM_TOKEN:
-            raise SystemExit("TELEGRAM_TOKEN manquant")
-        log("📬 Écoute /start (Ctrl+C pour arrêter)...")
-        while True:
-            process_telegram_updates()
-            time.sleep(3)
+    if len(sys.argv) > 1 and sys.argv[1] in ("--poll-subscribers", "--bot"):
+        run_bot_polling()
     else:
         main()
