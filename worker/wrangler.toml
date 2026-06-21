@@ -6,7 +6,7 @@ compatibility_date = "2024-11-01"
 # Puis coller l'id ci-dessous
 [[kv_namespaces]]
 binding = "SUBSCRIBERS"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "98f8915d00ac46db83170f7a1f181dc7"
 
 # Secrets (wrangler secret put …) :
 # TELEGRAM_TOKEN, GITHUB_PAT, GITHUB_REPO, WEBHOOK_SECRET, SETUP_SECRET, WORKER_API_SECRET

@@ -1,0 +1,32 @@
+name: Bootstrap Worker Config
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write bootstrap bundle
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          GITHUB_PAT: ${{ secrets.WORKER_GITHUB_PAT }}
+        run: |
+          mkdir -p bootstrap
+          printf '%s' "$TELEGRAM_TOKEN" > bootstrap/telegram_token
+          if [ -n "$GITHUB_PAT" ]; then
+            printf '%s' "$GITHUB_PAT" > bootstrap/github_pat
+          fi
+          openssl rand -hex 32 > bootstrap/webhook_secret
+          openssl rand -hex 32 > bootstrap/setup_secret
+          openssl rand -hex 32 > bootstrap/worker_api_secret
+
+      - name: Upload bootstrap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-bootstrap
+          path: bootstrap/
+          retention-days: 1
