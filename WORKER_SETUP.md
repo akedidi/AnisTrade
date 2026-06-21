@@ -1,15 +1,15 @@
 # AnisTrade — Cloudflare Worker + GitHub Actions
 
-Architecture hybride (100 % gratuit) :
+**Worker déployé** : `https://anistrade-telegram.kedidi-anis.workers.dev`
 
 | Composant | Rôle |
 |-----------|------|
-| **Cloudflare Worker** | Webhook Telegram, `/start`, `/menu`, message « Analyse en cours » instantané |
-| **GitHub Actions** | Scans lourds (`bot.py`) déclenchés à la demande + alerte Highlights 14h UTC |
+| **Cloudflare Worker** | Webhook Telegram instantané |
+| **GitHub Actions** | Scans lourds (`telegram-command.yml`) + Highlights 14h UTC |
 
 ---
 
-## 1. Prérequis
+## Architecture
 
 - Compte [Cloudflare](https://dash.cloudflare.com) (gratuit)
 - Node.js 18+
