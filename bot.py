@@ -15,6 +15,8 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+WORKER_SUBSCRIBERS_URL = os.getenv("WORKER_SUBSCRIBERS_URL")
+WORKER_API_SECRET = os.getenv("WORKER_API_SECRET")
 
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
@@ -204,6 +206,21 @@ def _default_subscribers():
 
 def load_subscribers():
     data = _default_subscribers()
+    if WORKER_SUBSCRIBERS_URL:
+        try:
+            headers = {}
+            if WORKER_API_SECRET:
+                headers["Authorization"] = f"Bearer {WORKER_API_SECRET}"
+            resp = requests.get(WORKER_SUBSCRIBERS_URL, headers=headers, timeout=15)
+            if resp.ok:
+                loaded = resp.json()
+                if isinstance(loaded.get("chat_ids"), list):
+                    data["chat_ids"] = [str(c) for c in loaded["chat_ids"]]
+                    log(f"📬 Abonnés chargés depuis Worker : {len(data['chat_ids'])}")
+                    return data
+            log(f"⚠️ Worker subscribers HTTP {resp.status_code}")
+        except Exception as e:
+            log(f"⚠️ Worker subscribers : {e}")
     if os.path.exists(SUBSCRIBERS_FILE):
         try:
             with open(SUBSCRIBERS_FILE, encoding="utf-8") as f:
@@ -302,9 +319,10 @@ def _handle_start(chat_id, data):
     return new
 
 
-def _handle_menu_action(chat_id, action_key):
+def _handle_menu_action(chat_id, action_key, skip_pending_msg=False):
     log(f"📲 Commande '{action_key}' demandée par {chat_id}")
-    send_to_chat(chat_id, "⏳ <i>Analyse en cours…</i>")
+    if not skip_pending_msg:
+        send_to_chat(chat_id, "⏳ <i>Analyse en cours…</i>")
     try:
         scan = get_scan_data(force=True)
         formatters = {
@@ -1598,8 +1616,6 @@ def main():
     if not TELEGRAM_TOKEN:
         raise Exception("Secret TELEGRAM_TOKEN manquant. Vérifiez vos Secrets GitHub.")
 
-    register_bot_commands()
-    process_telegram_updates(handle_menus=True)
     if not get_subscriber_chat_ids():
         raise Exception(
             "Aucun abonné Telegram. Envoyez /start au bot ou définissez TELEGRAM_CHAT_ID."
@@ -1612,6 +1628,16 @@ def main():
     log(f"📨 Message Highlights : {len(message)} caractères → tous les abonnés")
     send_telegram(message)
     log("🚀 Alerte Highlights envoyée !")
+
+
+def run_command_for_chat(action_key, chat_id):
+    """Exécute une commande menu pour un seul chat (déclenché par GitHub Actions)."""
+    if action_key not in {
+        "highlights", "actions", "etfs", "runners", "furtifs", "extended",
+    }:
+        raise ValueError(f"Commande inconnue : {action_key}")
+    # Le Worker a déjà envoyé « Analyse en cours »
+    _handle_menu_action(chat_id, action_key, skip_pending_msg=True)
 
 
 def run_bot_polling():
@@ -1658,5 +1684,11 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "--poll-window":
         seconds = int(sys.argv[2]) if len(sys.argv) > 2 else 270
         run_poll_window(seconds)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--command":
+        action = sys.argv[sys.argv.index("--command") + 1]
+        chat_id = sys.argv[sys.argv.index("--chat-id") + 1]
+        if not TELEGRAM_TOKEN:
+            raise SystemExit("TELEGRAM_TOKEN manquant")
+        run_command_for_chat(action, chat_id)
     else:
         main()

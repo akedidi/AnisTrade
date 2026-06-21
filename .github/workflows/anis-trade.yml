@@ -6,7 +6,7 @@ on:
     - cron: '0 14 * * 1-5'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run-bot:
@@ -30,13 +30,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          WORKER_SUBSCRIBERS_URL: ${{ secrets.WORKER_SUBSCRIBERS_URL }}
+          WORKER_API_SECRET: ${{ secrets.WORKER_API_SECRET }}
         run: |
           python -u bot.py
-
-      - name: Persist subscribers
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add subscribers.json
-          git diff --staged --quiet || git commit -m "Update Telegram subscribers"
-          git push

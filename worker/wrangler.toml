@@ -1,0 +1,12 @@
+name = "anistrade-telegram"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# Créer le namespace : wrangler kv namespace create SUBSCRIBERS
+# Puis coller l'id ci-dessous
+[[kv_namespaces]]
+binding = "SUBSCRIBERS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Secrets (wrangler secret put …) :
+# TELEGRAM_TOKEN, GITHUB_PAT, GITHUB_REPO, WEBHOOK_SECRET, SETUP_SECRET, WORKER_API_SECRET
