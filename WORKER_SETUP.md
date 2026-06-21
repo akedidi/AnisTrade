@@ -11,6 +11,24 @@
 
 ## Architecture
 
+```
+Telegram → Worker (instantané) → GitHub Actions (scan 3–6 min)
+```
+
+## Re-déploiement
+
+```bash
+cd worker && npm install && npx wrangler deploy
+```
+
+Secrets GitHub déjà configurés : `WORKER_SUBSCRIBERS_URL`, `WORKER_API_SECRET`, `WORKER_GITHUB_PAT`.
+
+---
+
+## Setup manuel (référence)
+
+### Prérequis
+
 - Compte [Cloudflare](https://dash.cloudflare.com) (gratuit)
 - Node.js 18+
 - Token Telegram (BotFather)
