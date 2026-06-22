@@ -218,13 +218,25 @@ def _http_get(url, params=None, timeout=10, retries=HTTP_RETRIES):
     for attempt in range(retries + 1):
         try:
             resp = requests.get(url, params=params, timeout=timeout)
-            if resp.ok:
+            if resp.ok and resp.content:
                 return resp
         except requests.RequestException:
             pass
         if attempt < retries:
             time.sleep(0.35 * (attempt + 1))
     return None
+
+
+def _response_json(resp, default=None):
+    """Parse JSON sans planter si le corps est vide ou invalide."""
+    if resp is None:
+        return default
+    try:
+        if not resp.content:
+            return default
+        return resp.json()
+    except (ValueError, json.JSONDecodeError):
+        return default
 
 
 def _safe_num(val, default=0):
@@ -278,11 +290,11 @@ def escape_html(text):
 
 def _telegram_post_ok(resp):
     try:
-        data = resp.json()
-    except ValueError:
-        return False, resp.text[:400]
+        data = _response_json(resp, default={})
+    except Exception:
+        return False, (resp.text or "")[:400]
     if not data.get("ok"):
-        return False, data.get("description", resp.text[:400])
+        return False, data.get("description", (resp.text or "")[:400])
     return True, None
 
 
@@ -299,7 +311,7 @@ def load_subscribers():
                 headers["Authorization"] = f"Bearer {WORKER_API_SECRET}"
             resp = requests.get(WORKER_SUBSCRIBERS_URL, headers=headers, timeout=15)
             if resp.ok:
-                loaded = resp.json()
+                loaded = _response_json(resp, default={})
                 if isinstance(loaded.get("chat_ids"), list):
                     data["chat_ids"] = [str(c) for c in loaded["chat_ids"]]
                     log(f"📬 Abonnés chargés depuis Worker : {len(data['chat_ids'])}")
@@ -443,7 +455,7 @@ def process_telegram_updates(handle_menus=False):
         if not ok:
             log(f"⚠️ getUpdates : {err}")
             return data
-        updates = resp.json().get("result", [])
+        updates = _response_json(resp, default={}).get("result", [])
     except Exception as e:
         log(f"⚠️ getUpdates : {e}")
         return data
@@ -1020,7 +1032,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
     try:
         rec_resp = _http_get(f"{FINNHUB_BASE}/stock/recommendation", params=params)
         if rec_resp:
-            rec_data = rec_resp.json()
+            rec_data = _response_json(rec_resp, default=[])
             if isinstance(rec_data, list) and rec_data:
                 latest = rec_data[0]
                 buy = int(latest.get("buy", 0) or 0) + int(latest.get("strongBuy", 0) or 0)
@@ -1030,7 +1042,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
 
         news_resp = _http_get(f"{FINNHUB_BASE}/news-sentiment", params=params)
         if news_resp:
-            news = news_resp.json()
+            news = _response_json(news_resp, default={}) or {}
             ns = news.get("companyNewsScore")
             entry["news_score"] = ns
             if ns is not None:
@@ -1044,7 +1056,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             params={**params, "from": social_from, "to": social_to},
         )
         if social_resp:
-            social_data = social_resp.json()
+            social_data = _response_json(social_resp, default=[])
             items = social_data if isinstance(social_data, list) else social_data.get("data", [])
             if items:
                 scores = [float(x.get("score", 0) or 0) for x in items if x.get("score") is not None]
@@ -1055,7 +1067,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
 
         pt_resp = _http_get(f"{FINNHUB_BASE}/stock/price-target", params=params)
         if pt_resp:
-            pt = pt_resp.json()
+            pt = _response_json(pt_resp, default={}) or {}
             target = pt.get("targetMean") or pt.get("targetHigh")
             if target:
                 entry["price_target"] = float(target)
@@ -1065,7 +1077,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             params={**params, "from": news_from, "to": news_to},
         )
         if cn_resp:
-            for article in cn_resp.json() or []:
+            for article in _response_json(cn_resp, default=[]) or []:
                 art_date = _article_date(article, today)
                 if art_date and (today - art_date).days > NEWS_CATALYST_MAX_AGE_DAYS:
                     continue
@@ -1088,7 +1100,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             params={**params, "from": today.isoformat(), "to": (today + timedelta(days=120)).isoformat()},
         )
         if earn_resp and not entry.get("catalyst"):
-            for ev in earn_resp.json() or []:
+            for ev in _response_json(earn_resp, default=[]) or []:
                 if (ev.get("symbol") or "").upper() != ticker:
                     continue
                 ed = ev.get("date") or ev.get("period")
@@ -1360,28 +1372,64 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
     }
 
 
+def _fda_event_symbols(ev):
+    """Extrait les tickers d'un événement FDA (champ symbol ou texte)."""
+    symbols = []
+    for key in ("symbol", "ticker", "Symbol", "Ticker"):
+        sym = (ev.get(key) or "").strip().upper()
+        if sym and SYMBOL_RE.match(sym):
+            symbols.append(sym)
+    text = " ".join(
+        str(ev.get(k) or "") for k in ("eventDescription", "description", "event", "title")
+    )
+    for match in re.findall(r"\(([A-Z]{1,5})\)", text):
+        if SYMBOL_RE.match(match):
+            symbols.append(match)
+    return symbols
+
+
 def fetch_fda_calendar_tickers(nasdaq_stocks):
-    """Symboles US avec événement FDA à venir (univers pré-catalyseur biotech)."""
+    """Symboles US liés à des événements FDA à venir (univers pré-catalyseur biotech)."""
     if not FINNHUB_API_KEY:
         return []
-    today = date.today()
-    end = today + timedelta(days=120)
-    resp = _http_get(
-        f"{FINNHUB_BASE}/fda-calendar",
-        params={"from": today.isoformat(), "to": end.isoformat(), "token": FINNHUB_API_KEY},
-        timeout=15,
-    )
-    if not resp:
+    try:
+        resp = _http_get(
+            f"{FINNHUB_BASE}/fda-advisory-committee-calendar",
+            params={"token": FINNHUB_API_KEY},
+            timeout=15,
+        )
+        if not resp:
+            return []
+        events = _response_json(resp, default=[])
+        if not isinstance(events, list):
+            return []
+        today = date.today()
+        symbols = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            event_date = None
+            for key in ("fromDate", "toDate", "date"):
+                raw = ev.get(key)
+                if not raw:
+                    continue
+                try:
+                    event_date = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+                    break
+                except ValueError:
+                    continue
+            if event_date is not None and event_date < today:
+                continue
+            for sym in _fda_event_symbols(ev):
+                if sym in nasdaq_stocks:
+                    symbols.append(sym)
+        symbols = list(dict.fromkeys(symbols))
+        if symbols:
+            log(f"🧬 FDA calendar : {len(symbols)} symboles pré-catalyseur")
+        return symbols
+    except Exception as e:
+        log(f"   ⚠️ FDA calendar : {e}")
         return []
-    symbols = []
-    for ev in resp.json() or []:
-        sym = (ev.get("symbol") or "").strip().upper()
-        if sym and sym in nasdaq_stocks and SYMBOL_RE.match(sym):
-            symbols.append(sym)
-    symbols = list(dict.fromkeys(symbols))
-    if symbols:
-        log(f"🧬 FDA calendar : {len(symbols)} symboles pré-catalyseur")
-    return symbols
 
 
 def analyze_candidates(tickers, sources, spy_ret_20d, precatalyst_tickers=None):
