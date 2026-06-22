@@ -41,9 +41,8 @@ SCREENER_COUNT = 250
 SCREENER_DELAY_SEC = 0.2
 
 RUNNER_MIN_PRICE = 2.0
-RUNNER_MAX_PRICE = 80.0
+RUNNER_MAX_PRICE = 2000.0
 RUNNER_MIN_MARKET_CAP = 50_000_000
-RUNNER_MAX_MARKET_CAP = 10_000_000_000
 RUNNER_MIN_VAR20 = 15.0
 RUNNER_MAX_VAR20 = 60.0
 RUNNER_STRICT_VOL_RATIO = 1.5
@@ -794,7 +793,7 @@ def _passes_screener_prefilter(ctx, sym, sources):
     price, cap = ctx.get("price"), ctx.get("market_cap")
     if price is None or price < RUNNER_MIN_PRICE or price > RUNNER_MAX_PRICE:
         return False
-    if cap is not None and (cap < RUNNER_MIN_MARKET_CAP or cap > RUNNER_MAX_MARKET_CAP):
+    if cap is not None and cap < RUNNER_MIN_MARKET_CAP:
         return False
     if _screener_priority(sym, sources) == 0 and sym not in sources["actives"]:
         return False
@@ -811,7 +810,7 @@ def build_runner_candidates(stock_quotes, nasdaq_stocks, sources):
     selected = [sym for sym, _, _, _ in candidates[:RUNNER_MAX_DOWNLOAD]]
     log(
         f"🎯 Cibles Rising Stars : {len(selected)} actions "
-        f"(cap ≥{RUNNER_MIN_MARKET_CAP // 1_000_000}M$, prix {RUNNER_MIN_PRICE}-{RUNNER_MAX_PRICE}$)"
+        f"(cap ≥{RUNNER_MIN_MARKET_CAP // 1_000_000}M$, prix {RUNNER_MIN_PRICE}-{RUNNER_MAX_PRICE:.0f}$)"
     )
     return selected
 
@@ -1229,7 +1228,7 @@ def fetch_finnhub_meta(tickers):
 
 def _passes_market_cap(analyst):
     cap = analyst.get("market_cap")
-    return cap is not None and RUNNER_MIN_MARKET_CAP <= cap <= RUNNER_MAX_MARKET_CAP
+    return cap is not None and cap >= RUNNER_MIN_MARKET_CAP
 
 
 def _furtif_signal_quality(var_1d, var_20d):
