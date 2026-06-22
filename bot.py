@@ -114,6 +114,7 @@ SCORE_W_SENTIMENT = 0.10
 
 # Highlights / x2 : favoriser entrée early (15–30 % idéal), pas déjà étendu
 HIGHLIGHT_MIN_FH_PCT = 30.0
+HIGHLIGHT_RUNNER_MIN_TARGET_UPSIDE = 15.0
 HIGHLIGHT_SWEET_VAR20_MAX = 35.0
 HIGHLIGHT_MAX_VAR20_HIGHLIGHTS = 48.0
 WHALE_MAX_VAR20 = 45.0
@@ -1199,6 +1200,20 @@ def _effective_whale_vol_oi(row, options_map=None, top_vol_oi=None):
     return None
 
 
+def _format_target_upside(up):
+    if up is None or (isinstance(up, float) and pd.isna(up)):
+        return None
+    return f"Target {float(up):+.0f}%"
+
+
+def _passes_runner_highlight_slot(row):
+    """Slots runners Highlights : pas de target analyste négatif ou trop faible."""
+    up = row.get("TargetUpside")
+    if up is None or (isinstance(up, float) and pd.isna(up)):
+        return True
+    return float(up) >= HIGHLIGHT_RUNNER_MIN_TARGET_UPSIDE
+
+
 def _passes_highlight_gate(row):
     """Filtres durs pour le top Highlights."""
     rb = row.get("RecBuyPct")
@@ -1736,7 +1751,7 @@ def build_stock_highlights(df_runners, df_stealth, df_x2):
             continue
         for _, row in df.iterrows():
             r = row.to_dict()
-            if not _passes_highlight_gate(r) or _row_qualifies_x2(r):
+            if not _passes_highlight_gate(r) or not _passes_runner_highlight_slot(r):
                 continue
             r["Signal"] = signal
             ticker = r["Ticker"]
@@ -1778,7 +1793,9 @@ def _format_compact_stock(row, options_map=None, stealth=False):
     if rb is not None and not pd.isna(rb):
         parts.append(f"FH {rb:.0f}%")
     elif up is not None and not pd.isna(up):
-        parts.append(f"Tgt +{up:.0f}%")
+        tgt = _format_target_upside(up)
+        if tgt:
+            parts.append(tgt)
     if options_map:
         vol_oi = _effective_whale_vol_oi(row, options_map)
         if vol_oi is not None:
@@ -1960,10 +1977,12 @@ def _format_highlight_stock(row, options_map):
 
     rb = row.get("RecBuyPct")
     up = row.get("TargetUpside")
-    if rb is not None:
+    if rb is not None and not pd.isna(rb):
         parts.append(f"FH {rb:.0f}%")
-    elif up is not None:
-        parts.append(f"Target +{up:.0f}%")
+    elif up is not None and not pd.isna(up):
+        tgt = _format_target_upside(up)
+        if tgt:
+            parts.append(tgt)
 
     news = row.get("SentimentScore")
     if news is not None and news != 50:
