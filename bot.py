@@ -232,6 +232,20 @@ def _http_get(url, params=None, timeout=10, retries=HTTP_RETRIES):
     return None
 
 
+def _json_items(data, *keys):
+    """Liste depuis une réponse API (tableau ou dict avec clé enveloppe)."""
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in keys:
+            items = data.get(key)
+            if isinstance(items, list):
+                return items
+    return []
+
+
 def _response_json(resp, default=None):
     """Parse JSON sans planter si le corps est vide ou invalide."""
     if resp is None:
@@ -570,6 +584,7 @@ def process_telegram_updates(handle_menus=False):
 def _send_telegram_to_chat(message, chat_id):
     chunks = _split_telegram_message(message)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    last_err = None
     for i, chunk in enumerate(chunks, 1):
         sent = False
         for parse_mode in ("HTML", None):
@@ -590,11 +605,14 @@ def _send_telegram_to_chat(message, chat_id):
                         f"({parse_mode or 'plain'}, {len(chunk)} chars)"
                     )
                     break
+                last_err = err
                 log(f"⚠️ Telegram → {chat_id} chunk {i} ({parse_mode or 'plain'}): {err}")
             except Exception as e:
+                last_err = str(e)
                 log(f"⚠️ Telegram → {chat_id} chunk {i}: {e}")
         if not sent:
-            raise RuntimeError(f"Échec envoi Telegram → {chat_id} (chunk {i}/{len(chunks)})")
+            return False, last_err or f"chunk {i}/{len(chunks)}"
+    return True, None
 
 
 def send_telegram(message):
@@ -609,8 +627,17 @@ def send_telegram(message):
         )
 
     log(f"📤 Envoi à {len(chat_ids)} abonné(s)...")
+    ok_count = 0
     for chat_id in chat_ids:
-        _send_telegram_to_chat(message, chat_id)
+        sent, err = _send_telegram_to_chat(message, chat_id)
+        if sent:
+            ok_count += 1
+        else:
+            log(f"❌ Échec envoi → {chat_id} ({err})")
+    if ok_count == 0:
+        raise RuntimeError(
+            f"Échec envoi Telegram vers tous les abonnés ({len(chat_ids)})"
+        )
 
 
 def _split_telegram_message(message, limit=4000):
@@ -1109,6 +1136,8 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             if ns is not None:
                 entry["news_pct"] = round(float(ns) * 100, 0)
             sent = news.get("sentiment") or {}
+            if not isinstance(sent, dict):
+                sent = {}
             entry["bullish_pct"] = sent.get("bullishPercent")
             entry["bearish_pct"] = sent.get("bearishPercent")
 
@@ -1120,7 +1149,11 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             social_data = _response_json(social_resp, default=[])
             items = social_data if isinstance(social_data, list) else social_data.get("data", [])
             if items:
-                scores = [float(x.get("score", 0) or 0) for x in items if x.get("score") is not None]
+                scores = [
+                    float(x.get("score", 0) or 0)
+                    for x in items
+                    if isinstance(x, dict) and x.get("score") is not None
+                ]
                 if scores:
                     avg = sum(scores) / len(scores)
                     entry["social_score"] = round(avg, 3)
@@ -1138,7 +1171,9 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             params={**params, "from": news_from, "to": news_to},
         )
         if cn_resp:
-            for article in _response_json(cn_resp, default=[]) or []:
+            for article in _json_items(_response_json(cn_resp, default=[])):
+                if not isinstance(article, dict):
+                    continue
                 art_date = _article_date(article, today)
                 if art_date and (today - art_date).days > NEWS_CATALYST_MAX_AGE_DAYS:
                     continue
@@ -1161,7 +1196,11 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             params={**params, "from": today.isoformat(), "to": (today + timedelta(days=120)).isoformat()},
         )
         if earn_resp and not entry.get("catalyst"):
-            for ev in _response_json(earn_resp, default=[]) or []:
+            for ev in _json_items(
+                _response_json(earn_resp, default=[]), "earningsCalendar",
+            ):
+                if not isinstance(ev, dict):
+                    continue
                 if (ev.get("symbol") or "").upper() != ticker:
                     continue
                 ed = ev.get("date") or ev.get("period")
