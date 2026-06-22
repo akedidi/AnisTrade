@@ -104,8 +104,9 @@ MENU_HELP = (
 )
 
 STEALTH_MAX_VOL_RATIO = 1.5
-STEALTH_MIN_OPT_VOL_OI = 5.0
+STEALTH_MIN_OPT_VOL_OI = 3.0
 STEALTH_MIN_VAR1D = -8.0
+ETF_MIN_RS20 = 0.0
 
 SCORE_W_MOMENTUM = 0.35
 SCORE_W_ANALYST = 0.30
@@ -178,6 +179,10 @@ OPTIONS_MIN_VOL_OI = 2.0
 OPTIONS_MIN_OI = 10
 OPTIONS_MIN_VOLUME_STOCK = 100
 OPTIONS_OTM_MIN_PCT = 1.02
+STEALTH_OPTIONS_MIN_VOL_OI = 2.0
+STEALTH_OPTIONS_MIN_VOLUME = 50
+STEALTH_OPTIONS_OTM_MIN_PCT = 1.01
+STEALTH_OPTIONS_MIN_OI = 5
 OPTIONS_DELAY_SEC = 0.25
 OPTIONS_CONTRACTS_PER_TICKER = 2
 
@@ -428,10 +433,21 @@ def _handle_menu_action(chat_id, action_key, skip_pending_msg=False):
             "highlights": lambda: format_highlights_telegram(
                 scan["stock_highlights"], scan["etf_highlights"], scan["spy_ret_20d"], scan["options_map"],
             ),
-            "actions": lambda: format_actions_telegram(scan["df_momentum"], scan["options_map"], scan["spy_ret_20d"]),
-            "etfs": lambda: format_etfs_telegram(scan["etf_data"], scan["spy_ret_20d"]),
-            "runners": lambda: format_runners_telegram(scan["df_runners"], scan["options_map"], scan["spy_ret_20d"]),
-            "furtifs": lambda: format_furtifs_telegram(scan["df_stealth"], scan["options_map"], scan["spy_ret_20d"]),
+            "actions": lambda: format_actions_telegram(
+                scan["df_momentum"], scan["options_map"], scan["spy_ret_20d"],
+                highlight_tickers=[r["Ticker"] for r in scan["stock_highlights"]],
+            ),
+            "etfs": lambda: format_etfs_telegram(
+                scan["etf_data"], scan["spy_ret_20d"], etf_highlights=scan["etf_highlights"],
+            ),
+            "runners": lambda: format_runners_telegram(
+                scan["df_runners"], scan["options_map"], scan["spy_ret_20d"],
+                stock_highlights=scan["stock_highlights"],
+            ),
+            "furtifs": lambda: format_furtifs_telegram(
+                scan["df_stealth"], scan["options_map"], scan["spy_ret_20d"],
+                df_stealth_pool=scan.get("df_stealth_pool"),
+            ),
             "extended": lambda: format_extended_telegram(scan["df_extended"], scan["spy_ret_20d"]),
         }
         send_to_chat(chat_id, formatters[action_key]())
@@ -1171,6 +1187,18 @@ def _passes_market_cap(analyst):
     return cap is not None and RUNNER_MIN_MARKET_CAP <= cap <= RUNNER_MAX_MARKET_CAP
 
 
+def _furtif_signal_quality(var_1d, var_20d):
+    """Furtif : volume spot discret — pas besoin d'un gros jour vert."""
+    try:
+        if var_1d is not None and float(var_1d) <= STEALTH_MIN_VAR1D:
+            return False
+        if var_20d is not None and float(var_20d) >= WHALE_MAX_VAR20:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _whale_signal_quality(var_1d, var_20d):
     """CALL OTM crédible : jour vert et pas déjà +45 % sur 20j."""
     try:
@@ -1183,8 +1211,8 @@ def _whale_signal_quality(var_1d, var_20d):
     return True
 
 
-def _effective_whale_vol_oi(row, options_map=None, top_vol_oi=None):
-    """Vol/OI options compté seulement si signal whale qualifié."""
+def _effective_whale_vol_oi(row, options_map=None, top_vol_oi=None, stealth=False):
+    """Vol/OI options — critères assouplis pour les furtifs."""
     vol_oi = top_vol_oi
     ticker = row.get("Ticker") if isinstance(row, dict) else row["Ticker"]
     if vol_oi is None and options_map:
@@ -1195,9 +1223,26 @@ def _effective_whale_vol_oi(row, options_map=None, top_vol_oi=None):
         return None
     var_1d = row.get("Var1j") if isinstance(row, dict) else row["Var1j"]
     var_20d = row.get("Var20j") if isinstance(row, dict) else row["Var20j"]
-    if _whale_signal_quality(var_1d, var_20d):
+    check = _furtif_signal_quality if stealth else _whale_signal_quality
+    if check(var_1d, var_20d):
         return vol_oi
     return None
+
+
+def _format_analyst_parts(row):
+    """FH (consensus analystes Finnhub) + Target (upside prix cible) — complémentaires."""
+    parts = []
+    rb = row.get("RecBuyPct")
+    up = row.get("TargetUpside")
+    if rb is not None and not pd.isna(rb):
+        parts.append(f"FH {float(rb):.0f}%")
+    if up is not None and not pd.isna(up):
+        tgt = _format_target_upside(up)
+        if tgt:
+            parts.append(tgt)
+    elif row.get("AnalystBuy") and not parts:
+        parts.append("Buy")
+    return parts
 
 
 def _format_target_upside(up):
@@ -1224,13 +1269,19 @@ def _passes_highlight_gate(row):
     return True
 
 
-def filter_quality_df(df):
-    """Applique les filtres Highlights aux menus actions/runners."""
+def filter_quality_df(df, early_entry_sort=False):
+    """Filtres qualité menus — gate Highlights + target min."""
     if df is None or df.empty:
         return df
-    rows = [row.to_dict() for _, row in df.iterrows() if _passes_highlight_gate(row.to_dict())]
+    rows = [
+        row.to_dict() for _, row in df.iterrows()
+        if _passes_highlight_gate(row.to_dict()) and _passes_runner_highlight_slot(row.to_dict())
+    ]
     if not rows:
         return pd.DataFrame()
+    if early_entry_sort:
+        rows = sorted(rows, key=_highlight_rank_score, reverse=True)
+        return pd.DataFrame(rows)
     out = pd.DataFrame(rows)
     return out.sort_values(by=["Score", "Var20j"], ascending=False)
 
@@ -1640,10 +1691,13 @@ def short_expiry(exp_str):
         return exp_str
 
 
-def _uoa_calls_otm(df, expiry, spot_price, min_volume):
+def _uoa_calls_otm(df, expiry, spot_price, min_volume, min_vol_oi=None, otm_min_pct=None, min_oi=None):
     if df is None or df.empty or spot_price is None:
         return []
-    min_strike = spot_price * OPTIONS_OTM_MIN_PCT
+    min_vol_oi = OPTIONS_MIN_VOL_OI if min_vol_oi is None else min_vol_oi
+    otm_min_pct = OPTIONS_OTM_MIN_PCT if otm_min_pct is None else otm_min_pct
+    min_oi = OPTIONS_MIN_OI if min_oi is None else min_oi
+    min_strike = spot_price * otm_min_pct
     hits = []
     for row in df.itertuples(index=False):
         vol, oi, strike = getattr(row, "volume", None), getattr(row, "openInterest", None), getattr(row, "strike", None)
@@ -1653,10 +1707,10 @@ def _uoa_calls_otm(df, expiry, spot_price, min_volume):
         if strike < min_strike:
             continue
         vol, oi = int(vol), int(oi)
-        if vol < min_volume or oi < OPTIONS_MIN_OI or vol <= oi:
+        if vol < min_volume or oi < min_oi or vol <= oi:
             continue
         vol_oi = vol / oi
-        if vol_oi < OPTIONS_MIN_VOL_OI:
+        if vol_oi < min_vol_oi:
             continue
         hits.append({
             "side": "CALL", "strike": strike, "expiry": expiry,
@@ -1666,7 +1720,7 @@ def _uoa_calls_otm(df, expiry, spot_price, min_volume):
     return hits
 
 
-def scan_ticker_options(ticker, spot_price):
+def scan_ticker_options(ticker, spot_price, stealth=False):
     try:
         tk = yf.Ticker(to_yahoo_symbol(ticker))
         expirations = tk.options
@@ -1674,11 +1728,18 @@ def scan_ticker_options(ticker, spot_price):
             return []
     except Exception:
         return []
+    min_volume = STEALTH_OPTIONS_MIN_VOLUME if stealth else OPTIONS_MIN_VOLUME_STOCK
+    min_vol_oi = STEALTH_OPTIONS_MIN_VOL_OI if stealth else OPTIONS_MIN_VOL_OI
+    otm_min = STEALTH_OPTIONS_OTM_MIN_PCT if stealth else OPTIONS_OTM_MIN_PCT
+    min_oi = STEALTH_OPTIONS_MIN_OI if stealth else OPTIONS_MIN_OI
     hits = []
     for exp in expirations[:OPTIONS_MAX_EXPIRATIONS]:
         try:
             chain = tk.option_chain(exp)
-            hits.extend(_uoa_calls_otm(chain.calls, exp, spot_price, OPTIONS_MIN_VOLUME_STOCK))
+            hits.extend(_uoa_calls_otm(
+                chain.calls, exp, spot_price, min_volume,
+                min_vol_oi=min_vol_oi, otm_min_pct=otm_min, min_oi=min_oi,
+            ))
         except Exception:
             pass
         time.sleep(OPTIONS_DELAY_SEC)
@@ -1686,13 +1747,13 @@ def scan_ticker_options(ticker, spot_price):
     return hits[:OPTIONS_CONTRACTS_PER_TICKER]
 
 
-def scan_options_for_df(df, label):
+def scan_options_for_df(df, label, stealth=False):
     if df.empty:
         return {}
     log(f"🐳 Options {label} ({len(df)} tickers)...")
     options_map = {}
     for _, row in df.iterrows():
-        contracts = scan_ticker_options(row["Ticker"], row["Prix"])
+        contracts = scan_ticker_options(row["Ticker"], row["Prix"], stealth=stealth)
         if contracts:
             options_map[row["Ticker"]] = contracts
             top = contracts[0]
@@ -1705,7 +1766,7 @@ def build_stealth_df(df_pool, options_map):
         return pd.DataFrame()
     rows = []
     for _, row in df_pool.iterrows():
-        if not _whale_signal_quality(row["Var1j"], row["Var20j"]):
+        if not _furtif_signal_quality(row["Var1j"], row["Var20j"]):
             continue
         contracts = options_map.get(row["Ticker"])
         if not contracts:
@@ -1782,22 +1843,16 @@ def pick_etf_highlights(etf_data):
     return rows[:HIGHLIGHT_MAX_ETFS]
 
 
-def _format_compact_stock(row, options_map=None, stealth=False):
+def _format_compact_stock(row, options_map=None, stealth=False, highlight_tickers=None):
     """Une ligne compacte — ticker en gras."""
     ticker = escape_html(row["Ticker"])
+    pin = "⭐ " if highlight_tickers and row["Ticker"] in highlight_tickers else ""
     score = int(_safe_num(row.get("Score"), 0))
     risk = row.get("RiskEmoji", "🟠")
-    parts = [f"<b>{ticker}</b>", f"{score}{risk}", f"20j {_safe_num(row['Var20j']):+.0f}%"]
-    rb = row.get("RecBuyPct")
-    up = row.get("TargetUpside")
-    if rb is not None and not pd.isna(rb):
-        parts.append(f"FH {rb:.0f}%")
-    elif up is not None and not pd.isna(up):
-        tgt = _format_target_upside(up)
-        if tgt:
-            parts.append(tgt)
+    parts = [f"{pin}<b>{ticker}</b>", f"{score}{risk}", f"20j {_safe_num(row['Var20j']):+.0f}%"]
+    parts.extend(_format_analyst_parts(row))
     if options_map:
-        vol_oi = _effective_whale_vol_oi(row, options_map)
+        vol_oi = _effective_whale_vol_oi(row, options_map, stealth=stealth)
         if vol_oi is not None:
             icon = "🕵️" if stealth else "🐳"
             parts.append(f"{icon}{vol_oi:.1f}x")
@@ -1810,8 +1865,29 @@ def _spy_header(spy_ret_20d):
     return ""
 
 
-def format_actions_telegram(df_momentum, options_map, spy_ret_20d):
+def _pick_sector_actions_rows(rows, highlight_tickers):
+    """Épingle les Highlights du secteur puis complète avec le top score."""
+    highlight_tickers = set(highlight_tickers or [])
+    n_pin = sum(1 for r in rows if r["Ticker"] in highlight_tickers)
+    cap = MENU_MAX_PER_SECTOR + n_pin
+    picked, seen = [], set()
+    for row in rows:
+        if row["Ticker"] in highlight_tickers:
+            picked.append(row)
+            seen.add(row["Ticker"])
+    for row in rows:
+        if row["Ticker"] in seen:
+            continue
+        if len(picked) >= cap:
+            break
+        picked.append(row)
+        seen.add(row["Ticker"])
+    return picked
+
+
+def format_actions_telegram(df_momentum, options_map, spy_ret_20d, highlight_tickers=None):
     message = f"<b>{MENU_LABELS['actions']}</b>\n{_spy_header(spy_ret_20d)}"
+    highlight_tickers = set(highlight_tickers or [])
     df_momentum = filter_quality_df(df_momentum)
     if df_momentum is None or df_momentum.empty:
         return message + "<i>Aucune action qualifiée.</i>\n"
@@ -1820,48 +1896,80 @@ def format_actions_telegram(df_momentum, options_map, spy_ret_20d):
     for _, row in df.iterrows():
         grouped.setdefault(row.get("Category", "Autre"), []).append(row)
     for cat in SECTOR_ORDER:
-        rows = grouped.get(cat, [])[:MENU_MAX_PER_SECTOR]
+        rows = _pick_sector_actions_rows(grouped.get(cat, []), highlight_tickers)
         if not rows:
             continue
         message += f"\n<b>{SECTOR_LABELS[cat]}</b>\n"
         for row in rows:
-            message += _format_compact_stock(row, options_map)
+            message += _format_compact_stock(row, options_map, highlight_tickers=highlight_tickers)
     return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
 
 
-def format_etfs_telegram(etf_data, spy_ret_20d):
+def format_etfs_telegram(etf_data, spy_ret_20d, etf_highlights=None):
     message = f"<b>{MENU_LABELS['etfs']}</b>\n{_spy_header(spy_ret_20d)}"
     if not etf_data:
         return message + "<i>N/A</i>\n"
+    hl_tickers = {r["Ticker"] for r in (etf_highlights or [])}
+    shown = 0
     for group in ("CROISSANCE", "IA", "SEMI"):
-        rows = (etf_data.get(group) or [])[:MENU_MAX_ETF]
-        if not rows:
+        positive = [
+            r for r in (etf_data.get(group) or [])
+            if _safe_num(r.get("RS20j"), -999) > ETF_MIN_RS20
+        ]
+        if not positive:
             continue
+        best = max(positive, key=lambda x: x.get("RS20j", 0))
         message += f"\n<b>{ETF_GROUP_LABELS[group]}</b>\n"
-        for row in rows:
-            message += _format_highlight_etf(row)
+        message += _format_highlight_etf(best, best=best["Ticker"] in hl_tickers)
+        shown += 1
+    if not shown:
+        return message + "<i>Aucun ETF en surperformance vs SPY.</i>\n"
     return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
 
 
-def format_runners_telegram(df_runners, options_map, spy_ret_20d):
+def format_runners_telegram(df_runners, options_map, spy_ret_20d, stock_highlights=None):
     message = f"<b>{MENU_LABELS['runners']}</b>\n{_spy_header(spy_ret_20d)}"
-    message += f"<i>Vol &gt;= {RUNNER_STRICT_VOL_RATIO}x et jour vert</i>\n"
-    df_runners = filter_quality_df(df_runners)
+    hl_tickers = {r["Ticker"] for r in (stock_highlights or [])}
+    if stock_highlights:
+        message += "<b>⭐ Sélection Highlights</b>\n"
+        for row in stock_highlights:
+            message += _format_compact_stock(
+                row, options_map, highlight_tickers=hl_tickers,
+            )
+        message += f"\n<b>Runners volume</b> <i>(Vol &gt;= {RUNNER_STRICT_VOL_RATIO}x, jour vert)</i>\n"
+    else:
+        message += f"<i>Vol &gt;= {RUNNER_STRICT_VOL_RATIO}x et jour vert</i>\n"
+    df_runners = filter_quality_df(df_runners, early_entry_sort=True)
     if df_runners is None or df_runners.empty:
-        return message + "<i>Aucun runner aujourd'hui.</i>\n"
-    for _, row in df_runners.head(MENU_MAX_RUNNERS).iterrows():
-        message += _format_compact_stock(row, options_map)
+        if not stock_highlights:
+            return message + "<i>Aucun runner aujourd'hui.</i>\n"
+    else:
+        n = 0
+        for _, row in df_runners.iterrows():
+            if row["Ticker"] in hl_tickers:
+                continue
+            if n >= MENU_MAX_RUNNERS:
+                break
+            message += _format_compact_stock(row, options_map)
+            n += 1
+        if n == 0 and not stock_highlights:
+            message += "<i>Aucun runner aujourd'hui.</i>\n"
     return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
 
 
-def format_furtifs_telegram(df_stealth, options_map, spy_ret_20d):
+def format_furtifs_telegram(df_stealth, options_map, spy_ret_20d, df_stealth_pool=None):
     message = f"<b>🕵️ ACHATS FURTIFS</b>\n{_spy_header(spy_ret_20d)}"
     message += f"<i>Vol &lt; {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI &gt;= {STEALTH_MIN_OPT_VOL_OI}x</i>\n"
-    if df_stealth is None or df_stealth.empty:
-        return message + "<i>Aucun signal furtif.</i>\n"
-    for _, row in df_stealth.head(MENU_MAX_STEALTH).iterrows():
-        message += _format_compact_stock(row, options_map, stealth=True)
-    return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+    if df_stealth is not None and not df_stealth.empty:
+        for _, row in df_stealth.head(MENU_MAX_STEALTH).iterrows():
+            message += _format_compact_stock(row, options_map, stealth=True)
+        return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+    if df_stealth_pool is not None and not df_stealth_pool.empty:
+        message += "<i>Aucun CALL qualifié — surveillance volume discret :</i>\n"
+        for _, row in df_stealth_pool.head(3).iterrows():
+            message += _format_compact_stock(row, options_map, stealth=True)
+        return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
+    return message + "<i>Aucun signal furtif.</i>\n"
 
 
 def format_extended_telegram(df_extended, spy_ret_20d):
@@ -1898,16 +2006,11 @@ def run_market_scan():
     )
 
     stealth_scan = df_stealth_pool.head(STEALTH_SCAN_CAP) if not df_stealth_pool.empty else df_stealth_pool
-    options_targets = []
+    options_map = {}
     if not df_runners.empty:
-        options_targets.append(df_runners.head(OPTIONS_SCAN_MAX_TICKERS))
+        options_map.update(scan_options_for_df(df_runners.head(OPTIONS_SCAN_MAX_TICKERS), "runners"))
     if not stealth_scan.empty:
-        options_targets.append(stealth_scan.head(OPTIONS_SCAN_MAX_TICKERS))
-    options_df = (
-        pd.concat(options_targets, ignore_index=True).drop_duplicates(subset=["Ticker"])
-        if options_targets else pd.DataFrame()
-    )
-    options_map = scan_options_for_df(options_df, "finalistes") if not options_df.empty else {}
+        options_map.update(scan_options_for_df(stealth_scan, "furtif", stealth=True))
 
     df_runners = apply_options_scores(df_runners, options_map)
     df_stealth = build_stealth_df(stealth_scan, options_map)
@@ -1935,6 +2038,7 @@ def run_market_scan():
         "spy_ret_20d": spy_ret_20d,
         "df_runners": df_runners,
         "df_stealth": df_stealth,
+        "df_stealth_pool": stealth_scan,
         "df_extended": df_extended,
         "df_momentum": df_momentum,
         "df_x2": df_x2,
@@ -1974,25 +2078,20 @@ def _format_highlight_stock(row, options_map):
     risk = row.get("RiskEmoji", "🟠")
     score = int(_safe_num(row.get("Score"), 0))
     parts = [f"<b>{ticker}</b>", f"Score {score} {risk}", f"20j {_safe_num(row['Var20j']):+.0f}%"]
-
-    rb = row.get("RecBuyPct")
-    up = row.get("TargetUpside")
-    if rb is not None and not pd.isna(rb):
-        parts.append(f"FH {rb:.0f}%")
-    elif up is not None and not pd.isna(up):
-        tgt = _format_target_upside(up)
-        if tgt:
-            parts.append(tgt)
+    parts.extend(_format_analyst_parts(row))
 
     news = row.get("SentimentScore")
-    if news is not None and news != 50:
-        parts.append(f"News {news:.0f}")
+    if news is not None and not pd.isna(news) and float(news) != 50:
+        parts.append(f"News {float(news):.0f}")
 
-    vol_oi = _effective_whale_vol_oi(row, options_map, row.get("TopVolOI"))
+    vol_oi = _effective_whale_vol_oi(
+        row, options_map, row.get("TopVolOI"),
+        stealth=row.get("Signal") == "furtif",
+    )
     if vol_oi is not None:
         icon = "🕵️" if row.get("Signal") == "furtif" else "🐳"
         parts.append(f"{icon} {vol_oi:.1f}x")
-    if row.get("Signal") == "x2" or _row_qualifies_x2(row):
+    if row.get("Signal") == "x2":
         parts.append("🎯 x2")
 
     line = " | ".join(parts)
