@@ -3,7 +3,7 @@ import re
 import json
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import requests
 import warnings
 import pandas as pd
@@ -766,9 +766,55 @@ def format_earnings_date(ts):
             dt = datetime.fromtimestamp(ts)
         else:
             dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.date() < date.today():
+            return None
         return dt.strftime("%d %b")
     except (ValueError, TypeError, OSError):
         return None
+
+
+def _parse_catalyst_event_date(catalyst, ref=None):
+    """Extrait une date d'événement depuis un libellé catalyseur (ou None)."""
+    if not catalyst:
+        return None
+    ref = ref or date.today()
+    text = str(catalyst)
+
+    iso = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            return None
+
+    dmy = re.search(
+        r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*(?:\s+(\d{4}))?",
+        text,
+        re.I,
+    )
+    if not dmy:
+        return None
+    year = int(dmy.group(3)) if dmy.group(3) else ref.year
+    try:
+        dt = datetime.strptime(f"{int(dmy.group(1))} {dmy.group(2)[:3].title()} {year}", "%d %b %Y")
+        return dt.date()
+    except ValueError:
+        return None
+
+
+def future_catalyst_only(catalyst, ref=None):
+    """Garde le catalyseur seulement s'il est à venir ou sans date (FDA, PDUFA, Phase III…)."""
+    if not catalyst:
+        return None
+    text = str(catalyst).strip()
+    if not text:
+        return None
+    event_date = _parse_catalyst_event_date(text, ref)
+    if event_date is None:
+        return text
+    if event_date >= (ref or date.today()):
+        return text
+    return None
 
 
 def sentiment_score(finnhub):
@@ -925,11 +971,20 @@ def fetch_finnhub_meta(tickers):
             )
             if earn_resp.ok and not entry.get("catalyst"):
                 for ev in earn_resp.json() or []:
-                    if (ev.get("symbol") or "").upper() == ticker:
-                        ed = ev.get("date") or ev.get("period")
-                        entry["catalyst"] = f"Résultats le {ed}" if ed else "Résultats à venir"
+                    if (ev.get("symbol") or "").upper() != ticker:
+                        continue
+                    ed = ev.get("date") or ev.get("period")
+                    if not ed:
+                        entry["catalyst"] = "Résultats à venir"
                         break
-
+                    try:
+                        ed_date = datetime.strptime(str(ed)[:10], "%Y-%m-%d").date()
+                    except ValueError:
+                        ed_date = None
+                    if ed_date is None or ed_date >= today:
+                        entry["catalyst"] = f"Résultats le {ed}"
+                        break
+            entry["catalyst"] = future_catalyst_only(entry.get("catalyst"), today)
             entry["finnhub_ok"] = True
         except Exception as e:
             log(f"   ⚠️ Finnhub {ticker}: {e}")
@@ -1050,9 +1105,9 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
     )
     beta, short_pct = analyst.get("beta"), analyst.get("short_pct")
     risk_label, risk_emoji = risk_level(beta, short_pct, vol_30d)
-    catalyst = fh.get("catalyst")
+    catalyst = future_catalyst_only(fh.get("catalyst"))
     if not catalyst and analyst.get("earnings_date"):
-        catalyst = f"Résultats le {analyst['earnings_date']}"
+        catalyst = future_catalyst_only(f"Résultats le {analyst['earnings_date']}")
     return {
         "Ticker": ticker,
         "Prix": price,
@@ -1170,7 +1225,7 @@ def enrich_with_finnhub(df_runners, df_stealth, df_extended, df_momentum=None):
                 r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
                 r["AnalystBuy"], r["TargetUpside"], r["Prix"], meta, top_vol_oi,
             )
-            catalyst = meta.get("catalyst") or r.get("Catalyst")
+            catalyst = future_catalyst_only(meta.get("catalyst") or r.get("Catalyst"))
             r.update({
                 "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
                 "SentimentScore": s, "Score": g,
@@ -1576,7 +1631,7 @@ def _format_highlight_stock(row, options_map):
         parts.append(f"{icon} {contracts[0]['vol_oi']:.1f}x")
 
     line = " | ".join(parts)
-    catalyst = row.get("Catalyst")
+    catalyst = future_catalyst_only(row.get("Catalyst"))
     if catalyst:
         line += f"\n📰 {escape_html(str(catalyst)[:55])}"
     return line + "\n"
