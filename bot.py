@@ -265,6 +265,33 @@ def _is_valid_num(val):
         return False
 
 
+def _score_component(val):
+    if not _is_valid_num(val):
+        return 0.0
+    return max(0.0, float(val))
+
+
+def _finnhub_meta_from_row(row):
+    """Reconstruit les métadonnées Finnhub déjà stockées dans une ligne."""
+    meta = {}
+    for key, row_key in (
+        ("rec_buy_pct", "RecBuyPct"),
+        ("news_score", "NewsScore"),
+        ("news_pct", "NewsPct"),
+        ("bullish_pct", "BullishPct"),
+        ("bearish_pct", "BearishPct"),
+        ("social_pct", "SocialPct"),
+        ("negative_fda_news", "NegativeFdaNews"),
+        ("catalyst", "Catalyst"),
+        ("catalyst_article_date", "CatalystArticleDate"),
+    ):
+        val = row.get(row_key)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        meta[key] = val
+    return meta
+
+
 def _fmt_pct(val, decimals=0, signed=True):
     if not _is_valid_num(val):
         return None
@@ -1380,11 +1407,16 @@ def options_score(top_vol_oi, var_1d=None, var_20d=None):
 
 
 def global_score(momentum, analyst, options, sentiment):
+    m = _score_component(momentum)
+    a = _score_component(analyst)
+    o = _score_component(options)
+    s = float(sentiment) if _is_valid_num(sentiment) else 50.0
+    s = max(0.0, min(100.0, s))
     return round(
-        SCORE_W_MOMENTUM * (momentum or 0)
-        + SCORE_W_ANALYST * (analyst or 0)
-        + SCORE_W_OPTIONS * (options or 0)
-        + SCORE_W_SENTIMENT * (sentiment or 50),
+        SCORE_W_MOMENTUM * m
+        + SCORE_W_ANALYST * a
+        + SCORE_W_OPTIONS * o
+        + SCORE_W_SENTIMENT * s,
         0,
     )
 
@@ -1398,7 +1430,53 @@ def compute_scores(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accel
     a = analyst_score(is_buy, target_upside, price, finnhub)
     o = options_score(top_vol_oi, var_1d, var_20d)
     s = sentiment_score(finnhub)
-    return m, a, o, s, global_score(m, a, o, s)
+    g = global_score(m, a, o, s)
+    if not _is_valid_num(g):
+        g = global_score(_score_component(m), _score_component(a), _score_component(o), s)
+    return m, a, o, s, g
+
+
+def _row_is_accelerating(row):
+    var_5d, var_20d = row.get("Var5j"), row.get("Var20j")
+    if not _is_valid_num(var_5d) or not _is_valid_num(var_20d):
+        return False
+    return float(var_5d) > 0 and float(var_5d) > float(var_20d) / 4
+
+
+def _recompute_row_scores(row, meta=None, options_map=None, stealth=None):
+    """Recalcule Score et sous-scores à partir des données de la ligne."""
+    r = dict(row)
+    meta = meta if meta is not None else _finnhub_meta_from_row(r)
+    if stealth is None:
+        stealth = r.get("Signal") == "furtif"
+    target_upside = _effective_target_upside(r.get("Prix"), r.get("TargetUpside"), meta)
+    top_vol_oi = _effective_whale_vol_oi(
+        r, options_map, top_vol_oi=r.get("TopVolOI"), stealth=stealth,
+    )
+    m, a, o, s, g = compute_scores(
+        r.get("Var1j"), r.get("Var5j"), r.get("Var20j"), r.get("RS20j"), r.get("VolRatio"),
+        r.get("Shorted"), _row_is_accelerating(r),
+        r.get("AnalystBuy"), target_upside, r.get("Prix"), meta, top_vol_oi,
+    )
+    r.update({
+        "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
+        "SentimentScore": s, "Score": g,
+        "TargetUpside": target_upside,
+        "TopVolOI": top_vol_oi,
+    })
+    return r
+
+
+def _display_score(row):
+    score = row.get("Score")
+    if not _is_valid_num(score):
+        score = global_score(
+            row.get("MomentumScore"), row.get("AnalystScore"),
+            row.get("OptionsScore"), row.get("SentimentScore"),
+        )
+    if not _is_valid_num(score):
+        return "n/d"
+    return str(int(round(float(score))))
 
 
 def get_spy_benchmark():
@@ -1604,22 +1682,12 @@ def enrich_with_finnhub(df_runners, df_stealth, df_extended, df_momentum=None):
         for _, row in df.iterrows():
             r = row.to_dict()
             meta = fh.get(r["Ticker"], {})
-            target_upside = _effective_target_upside(r.get("Prix"), r.get("TargetUpside"), meta)
-            top_vol_oi = _effective_whale_vol_oi(r, top_vol_oi=r.get("TopVolOI"))
-            m, a, o, s, g = compute_scores(
-                r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
-                r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
-                r["AnalystBuy"], target_upside, r["Prix"], meta, top_vol_oi,
-            )
+            r = _recompute_row_scores(r, meta=meta)
             catalyst = future_catalyst_only(
                 meta.get("catalyst") or r.get("Catalyst"),
                 source_date=meta.get("catalyst_article_date"),
             )
             r.update({
-                "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
-                "SentimentScore": s, "Score": g,
-                "TargetUpside": target_upside,
-                "TopVolOI": top_vol_oi,
                 "NewsScore": meta.get("news_score"),
                 "NewsPct": meta.get("news_pct"),
                 "RecBuyPct": meta.get("rec_buy_pct"),
@@ -1685,18 +1753,7 @@ def apply_options_scores(df, options_map):
         return df
     rows = []
     for _, row in df.iterrows():
-        r = row.to_dict()
-        top_vol_oi = _effective_whale_vol_oi(r, options_map)
-        m, a, o, s, g = compute_scores(
-            r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
-            r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
-            r["AnalystBuy"], r["TargetUpside"], r["Prix"], {}, top_vol_oi,
-        )
-        r.update({
-            "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
-            "SentimentScore": s, "Score": g, "TopVolOI": top_vol_oi,
-        })
-        rows.append(r)
+        rows.append(_recompute_row_scores(row.to_dict(), options_map=options_map))
     out = pd.DataFrame(rows)
     return out.sort_values(by=["Score", "Var20j"], ascending=False) if not out.empty else out
 
@@ -1864,7 +1921,7 @@ def _format_compact_stock(row, options_map=None, stealth=False, highlight_ticker
     """Une ligne action lisible — utilisée par tous les menus."""
     ticker = escape_html(row["Ticker"])
     pin = "⭐ " if highlight_tickers and row["Ticker"] in highlight_tickers else ""
-    score = int(_safe_num(row.get("Score"), 0))
+    score = _display_score(row)
     risk = row.get("RiskEmoji", "🟠")
     var_s = _fmt_pct(row.get("Var20j"), 0) or "n/d"
     parts = [f"{pin}<b>{ticker}</b>", f"Score {score} {risk}", f"{var_s} sur 20 j"]
@@ -2064,13 +2121,15 @@ def run_market_scan():
     if not stealth_scan.empty:
         options_map.update(scan_options_for_df(stealth_scan, "furtif", stealth=True))
 
-    df_runners = apply_options_scores(df_runners, options_map)
     df_stealth = build_stealth_df(stealth_scan, options_map)
-    df_stealth = apply_options_scores(df_stealth, options_map)
 
     df_runners, df_stealth, df_extended, df_momentum = enrich_with_finnhub(
         df_runners, df_stealth, df_extended, df_momentum,
     )
+
+    df_runners = apply_options_scores(df_runners, options_map)
+    df_stealth = apply_options_scores(df_stealth, options_map)
+    df_momentum = apply_options_scores(df_momentum, options_map)
     df_x2 = build_x2_df(df_momentum)
 
     stock_highlights = build_stock_highlights(df_runners, df_stealth, df_x2)
@@ -2078,6 +2137,9 @@ def run_market_scan():
         if row["Ticker"] not in options_map:
             extra = scan_options_for_df(pd.DataFrame([row]), "highlights")
             options_map.update(extra)
+    stock_highlights = [
+        _recompute_row_scores(row, options_map=options_map) for row in stock_highlights
+    ]
 
     etf_data = analyze_etf_watchlist(spy_ret_20d)
     etf_highlights = pick_etf_highlights(etf_data)
