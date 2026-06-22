@@ -256,6 +256,24 @@ def _safe_num(val, default=0):
     return val
 
 
+def _is_valid_num(val):
+    if val is None:
+        return False
+    try:
+        return not pd.isna(val) and float(val) == float(val)
+    except (TypeError, ValueError):
+        return False
+
+
+def _fmt_pct(val, decimals=0, signed=True):
+    if not _is_valid_num(val):
+        return None
+    v = float(val)
+    if signed:
+        return f"{v:+.{decimals}f} %"
+    return f"{v:.{decimals}f} %"
+
+
 def _effective_target_upside(price, yahoo_upside, fh_meta):
     upsides = []
     if yahoo_upside is not None and not pd.isna(yahoo_upside):
@@ -1234,21 +1252,20 @@ def _format_analyst_parts(row):
     parts = []
     rb = row.get("RecBuyPct")
     up = row.get("TargetUpside")
-    if rb is not None and not pd.isna(rb):
-        parts.append(f"FH {float(rb):.0f}%")
-    if up is not None and not pd.isna(up):
+    if _is_valid_num(rb):
+        parts.append(f"FH {float(rb):.0f} %")
+    if _is_valid_num(up):
         tgt = _format_target_upside(up)
         if tgt:
             parts.append(tgt)
     elif row.get("AnalystBuy") and not parts:
-        parts.append("Buy")
+        parts.append("Avis analystes : achat")
     return parts
 
 
 def _format_target_upside(up):
-    if up is None or (isinstance(up, float) and pd.isna(up)):
-        return None
-    return f"Target {float(up):+.0f}%"
+    pct = _fmt_pct(up, decimals=0, signed=True)
+    return f"Objectif analystes {pct}" if pct else None
 
 
 def _passes_runner_highlight_slot(row):
@@ -1844,25 +1861,39 @@ def pick_etf_highlights(etf_data):
 
 
 def _format_compact_stock(row, options_map=None, stealth=False, highlight_tickers=None):
-    """Une ligne compacte — ticker en gras."""
+    """Une ligne action lisible — utilisée par tous les menus."""
     ticker = escape_html(row["Ticker"])
     pin = "⭐ " if highlight_tickers and row["Ticker"] in highlight_tickers else ""
     score = int(_safe_num(row.get("Score"), 0))
     risk = row.get("RiskEmoji", "🟠")
-    parts = [f"{pin}<b>{ticker}</b>", f"{score}{risk}", f"20j {_safe_num(row['Var20j']):+.0f}%"]
+    var_s = _fmt_pct(row.get("Var20j"), 0) or "n/d"
+    parts = [f"{pin}<b>{ticker}</b>", f"Score {score} {risk}", f"{var_s} sur 20 j"]
     parts.extend(_format_analyst_parts(row))
     if options_map:
         vol_oi = _effective_whale_vol_oi(row, options_map, stealth=stealth)
-        if vol_oi is not None:
-            icon = "🕵️" if stealth else "🐳"
-            parts.append(f"{icon}{vol_oi:.1f}x")
-    return " | ".join(parts) + "\n"
+        if _is_valid_num(vol_oi):
+            if stealth:
+                parts.append(f"🕵️ gros CALL options (×{float(vol_oi):.1f})")
+            else:
+                parts.append(f"🐳 options actives (×{float(vol_oi):.1f})")
+    catalyst = future_catalyst_only(row.get("Catalyst"))
+    line = " | ".join(parts)
+    if catalyst and str(catalyst).strip().lower() not in ("nan", "none", "nat"):
+        line += f"\n📰 {escape_html(str(catalyst)[:55])}"
+    return line + "\n"
 
 
 def _spy_header(spy_ret_20d):
-    if spy_ret_20d is not None and not (isinstance(spy_ret_20d, float) and pd.isna(spy_ret_20d)):
-        return f"<i>SPY 20j: {spy_ret_20d:+.1f}%</i>\n"
-    return ""
+    if not _is_valid_num(spy_ret_20d):
+        return ""
+    v = float(spy_ret_20d)
+    if v >= 0:
+        return f"<i>Contexte : le marché US progresse de {v:.1f} % sur 20 jours.</i>\n"
+    return f"<i>Contexte : le marché US recule de {abs(v):.1f} % sur 20 jours.</i>\n"
+
+
+def _format_furtif_stock(row, options_map):
+    return _format_compact_stock(row, options_map, stealth=True)
 
 
 def _pick_sector_actions_rows(rows, highlight_tickers):
@@ -1886,7 +1917,11 @@ def _pick_sector_actions_rows(rows, highlight_tickers):
 
 
 def format_actions_telegram(df_momentum, options_map, spy_ret_20d, highlight_tickers=None):
-    message = f"<b>{MENU_LABELS['actions']}</b>\n{_spy_header(spy_ret_20d)}"
+    message = (
+        f"<b>{MENU_LABELS['actions']}</b>\n"
+        f"{_spy_header(spy_ret_20d)}"
+        "<i>Meilleures actions par secteur (⭐ = aussi dans Highlights).</i>\n"
+    )
     highlight_tickers = set(highlight_tickers or [])
     df_momentum = filter_quality_df(df_momentum)
     if df_momentum is None or df_momentum.empty:
@@ -1906,9 +1941,13 @@ def format_actions_telegram(df_momentum, options_map, spy_ret_20d, highlight_tic
 
 
 def format_etfs_telegram(etf_data, spy_ret_20d, etf_highlights=None):
-    message = f"<b>{MENU_LABELS['etfs']}</b>\n{_spy_header(spy_ret_20d)}"
+    message = (
+        f"<b>{MENU_LABELS['etfs']}</b>\n"
+        f"{_spy_header(spy_ret_20d)}"
+        "<i>Meilleur fonds par thème, en hausse face au marché US sur 20 jours.</i>\n"
+    )
     if not etf_data:
-        return message + "<i>N/A</i>\n"
+        return message + "<i>Données ETF indisponibles.</i>\n"
     hl_tickers = {r["Ticker"] for r in (etf_highlights or [])}
     shown = 0
     for group in ("CROISSANCE", "IA", "SEMI"):
@@ -1923,22 +1962,24 @@ def format_etfs_telegram(etf_data, spy_ret_20d, etf_highlights=None):
         message += _format_highlight_etf(best, best=best["Ticker"] in hl_tickers)
         shown += 1
     if not shown:
-        return message + "<i>Aucun ETF en surperformance vs SPY.</i>\n"
+        return message + "<i>Aucun ETF en hausse face au marché US aujourd'hui.</i>\n"
     return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
 
 
 def format_runners_telegram(df_runners, options_map, spy_ret_20d, stock_highlights=None):
-    message = f"<b>{MENU_LABELS['runners']}</b>\n{_spy_header(spy_ret_20d)}"
+    message = (
+        f"<b>{MENU_LABELS['runners']}</b>\n"
+        f"{_spy_header(spy_ret_20d)}"
+        "<i>Actions avec fort volume et journée positive — le mouvement est visible.</i>\n\n"
+    )
     hl_tickers = {r["Ticker"] for r in (stock_highlights or [])}
     if stock_highlights:
-        message += "<b>⭐ Sélection Highlights</b>\n"
+        message += "<b>⭐ Nos sélections du jour</b>\n"
         for row in stock_highlights:
             message += _format_compact_stock(
                 row, options_map, highlight_tickers=hl_tickers,
             )
-        message += f"\n<b>Runners volume</b> <i>(Vol &gt;= {RUNNER_STRICT_VOL_RATIO}x, jour vert)</i>\n"
-    else:
-        message += f"<i>Vol &gt;= {RUNNER_STRICT_VOL_RATIO}x et jour vert</i>\n"
+        message += "\n<b>Autres runners</b>\n"
     df_runners = filter_quality_df(df_runners, early_entry_sort=True)
     if df_runners is None or df_runners.empty:
         if not stock_highlights:
@@ -1958,29 +1999,40 @@ def format_runners_telegram(df_runners, options_map, spy_ret_20d, stock_highligh
 
 
 def format_furtifs_telegram(df_stealth, options_map, spy_ret_20d, df_stealth_pool=None):
-    message = f"<b>🕵️ ACHATS FURTIFS</b>\n{_spy_header(spy_ret_20d)}"
-    message += f"<i>Vol &lt; {STEALTH_MAX_VOL_RATIO}x, CALL Vol/OI &gt;= {STEALTH_MIN_OPT_VOL_OI}x</i>\n"
+    message = (
+        f"<b>🕵️ Achats furtifs</b>\n"
+        f"{_spy_header(spy_ret_20d)}"
+        "<i>Parieurs options actifs alors que l'action bouge peu "
+        "(signe d'un pari avant un mouvement).</i>\n\n"
+    )
     if df_stealth is not None and not df_stealth.empty:
+        message += "<b>Signaux détectés</b>\n"
         for _, row in df_stealth.head(MENU_MAX_STEALTH).iterrows():
-            message += _format_compact_stock(row, options_map, stealth=True)
+            message += _format_furtif_stock(row, options_map)
         return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
-    if df_stealth_pool is not None and not df_stealth_pool.empty:
-        message += "<i>Aucun CALL qualifié — surveillance volume discret :</i>\n"
-        for _, row in df_stealth_pool.head(3).iterrows():
-            message += _format_compact_stock(row, options_map, stealth=True)
-        return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
-    return message + "<i>Aucun signal furtif.</i>\n"
+    message += (
+        "<i>Aucun achat furtif détecté aujourd'hui "
+        "(pas d'options suspectes sur actions à volume discret).</i>\n"
+    )
+    return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
 
 
 def format_extended_telegram(df_extended, spy_ret_20d):
-    message = f"<b>📈 DÉJÀ EN RUN</b>\n{_spy_header(spy_ret_20d)}"
-    message += f"<i>&gt; {RUNNER_MAX_VAR20:.0f}% sur 20j — trop tard pour x2</i>\n"
+    message = (
+        f"<b>📈 Déjà en forte hausse</b>\n"
+        f"{_spy_header(spy_ret_20d)}"
+        f"<i>Actions déjà montées de plus de {RUNNER_MAX_VAR20:.0f} % sur 20 jours "
+        "— entrée tardive pour viser un doublement.</i>\n"
+    )
     if df_extended is None or df_extended.empty:
-        return message + "<i>Aucune action étirée.</i>\n"
+        return message + "<i>Aucune action dans cette catégorie aujourd'hui.</i>\n"
     for _, row in df_extended.head(MENU_MAX_EXTENDED).iterrows():
+        var_s = _fmt_pct(row.get("Var20j"), 0) or "n/d"
+        prix = f"{float(row['Prix']):.0f} $" if _is_valid_num(row.get("Prix")) else "n/d"
+        vol = f"×{float(row['VolRatio']):.1f}" if _is_valid_num(row.get("VolRatio")) else "n/d"
         message += (
             f"<b>{escape_html(row['Ticker'])}</b> "
-            f"{row['Var20j']:+.0f}% | {row['Prix']:.0f}$ | Vol {row['VolRatio']:.1f}x\n"
+            f"{var_s} sur 20 j | {prix} | volume {vol}\n"
         )
     return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
 
@@ -2074,58 +2126,52 @@ def get_scan_data(force=False):
 
 
 def _format_highlight_stock(row, options_map):
-    ticker = escape_html(row["Ticker"])
-    risk = row.get("RiskEmoji", "🟠")
-    score = int(_safe_num(row.get("Score"), 0))
-    parts = [f"<b>{ticker}</b>", f"Score {score} {risk}", f"20j {_safe_num(row['Var20j']):+.0f}%"]
-    parts.extend(_format_analyst_parts(row))
-
-    news = row.get("SentimentScore")
-    if news is not None and not pd.isna(news) and float(news) != 50:
-        parts.append(f"News {float(news):.0f}")
-
-    vol_oi = _effective_whale_vol_oi(
-        row, options_map, row.get("TopVolOI"),
+    line = _format_compact_stock(
+        row, options_map,
         stealth=row.get("Signal") == "furtif",
-    )
-    if vol_oi is not None:
-        icon = "🕵️" if row.get("Signal") == "furtif" else "🐳"
-        parts.append(f"{icon} {vol_oi:.1f}x")
+    ).rstrip("\n")
+    news = row.get("SentimentScore")
+    if _is_valid_num(news) and float(news) != 50:
+        extra = f" | Sentiment news {float(news):.0f}"
+        if "\n📰" in line:
+            line = line.replace("\n📰", extra + "\n📰", 1)
+        else:
+            line += extra
     if row.get("Signal") == "x2":
-        parts.append("🎯 x2")
-
-    line = " | ".join(parts)
-    catalyst = future_catalyst_only(row.get("Catalyst"))
-    if catalyst:
-        line += f"\n📰 {escape_html(str(catalyst)[:55])}"
+        line += " | 🎯 x2"
     return line + "\n"
 
 
 def _format_highlight_etf(row, best=False):
     star = " ⭐" if best else ""
+    var20 = _fmt_pct(row.get("Var20j"), 1) or "n/d"
+    vs_marche = _fmt_pct(row.get("RS20j"), 1) or "n/d"
+    prix = f"{float(row.get('Prix')):.0f} $" if _is_valid_num(row.get("Prix")) else "n/d"
     return (
         f"<b>{escape_html(row['Ticker'])}</b>{star} "
-        f"20j {row['Var20j']:+.1f}% | RS {row.get('RS20j', 0):+.1f}% | {row['Prix']:.0f}$\n"
+        f"{var20} sur 20 j | {vs_marche} vs marché US | {prix}\n"
     )
 
 
 def format_highlights_telegram(stock_highlights, etf_highlights, spy_ret_20d, options_map):
-    message = "🚀 <b>AnisTrade — Highlights</b>\n"
-    if spy_ret_20d is not None and not (isinstance(spy_ret_20d, float) and pd.isna(spy_ret_20d)):
-        message += f"<i>SPY 20j: {spy_ret_20d:+.1f}%</i>\n"
-    message += f"\n<b>📈 ACTIONS</b> <i>(top {HIGHLIGHT_MAX_STOCKS})</i>\n"
+    message = (
+        "🚀 <b>AnisTrade — Highlights</b>\n"
+        f"{_spy_header(spy_ret_20d)}"
+        "<i>Notre sélection du jour : actions et ETF les plus prometteurs.</i>\n\n"
+        "<b>📈 Meilleures actions</b>\n"
+    )
     if stock_highlights:
         for row in stock_highlights:
             message += _format_highlight_stock(row, options_map)
     else:
         message += "<i>Rien de convaincant aujourd'hui.</i>\n"
 
-    message += f"\n<b>📊 ETF</b> <i>(top {HIGHLIGHT_MAX_ETFS})</i>\n"
+    message += "\n<b>📊 Fonds ETF</b>\n"
     if etf_highlights:
         for i, row in enumerate(etf_highlights):
             message += _format_highlight_etf(row, best=(i == 0))
     else:
-        message += "<i>N/A</i>\n"
+        message += "<i>Aucun fonds ETF à mettre en avant.</i>\n"
 
     message += "\n⚠️ <i>Pas un conseil d'investissement.</i>"
     return message
