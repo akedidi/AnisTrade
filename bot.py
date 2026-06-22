@@ -108,6 +108,13 @@ SCORE_W_ANALYST = 0.30
 SCORE_W_OPTIONS = 0.25
 SCORE_W_SENTIMENT = 0.10
 
+# Highlights / x2 : favoriser entrée early (15–30 % idéal), pas déjà étendu
+HIGHLIGHT_MIN_FH_PCT = 30.0
+HIGHLIGHT_SWEET_VAR20_MAX = 35.0
+HIGHLIGHT_MAX_VAR20_HIGHLIGHTS = 48.0
+WHALE_MAX_VAR20 = 45.0
+WHALE_MIN_VAR1D = 0.0
+
 X2_MIN_TARGET_UPSIDE = 50.0
 X2_STRONG_TARGET_UPSIDE = 80.0
 
@@ -1001,6 +1008,54 @@ def _passes_market_cap(analyst):
     return cap is not None and RUNNER_MIN_MARKET_CAP <= cap <= RUNNER_MAX_MARKET_CAP
 
 
+def _whale_signal_quality(var_1d, var_20d):
+    """CALL OTM crédible : jour vert et pas déjà +45 % sur 20j."""
+    try:
+        if var_1d is None or float(var_1d) <= WHALE_MIN_VAR1D:
+            return False
+        if var_20d is not None and float(var_20d) >= WHALE_MAX_VAR20:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _effective_whale_vol_oi(row, options_map=None, top_vol_oi=None):
+    """Vol/OI options compté seulement si signal whale qualifié."""
+    vol_oi = top_vol_oi
+    ticker = row.get("Ticker") if isinstance(row, dict) else row["Ticker"]
+    if vol_oi is None and options_map:
+        contracts = options_map.get(ticker)
+        if contracts:
+            vol_oi = contracts[0].get("vol_oi")
+    if vol_oi is None:
+        return None
+    var_1d = row.get("Var1j") if isinstance(row, dict) else row["Var1j"]
+    var_20d = row.get("Var20j") if isinstance(row, dict) else row["Var20j"]
+    if _whale_signal_quality(var_1d, var_20d):
+        return vol_oi
+    return None
+
+
+def _passes_highlight_gate(row):
+    """Filtres durs pour le top Highlights."""
+    rb = row.get("RecBuyPct")
+    if rb is not None and not pd.isna(rb) and float(rb) < HIGHLIGHT_MIN_FH_PCT:
+        return False
+    if _safe_num(row.get("Var20j"), 0) > HIGHLIGHT_MAX_VAR20_HIGHLIGHTS:
+        return False
+    return True
+
+
+def _highlight_rank_score(row):
+    """Score de tri Highlights — pénalise les actions déjà parties."""
+    score = float(_safe_num(row.get("Score"), 0))
+    var20 = _safe_num(row.get("Var20j"), 0)
+    if var20 > HIGHLIGHT_SWEET_VAR20_MAX:
+        score -= min((var20 - HIGHLIGHT_SWEET_VAR20_MAX) * 1.2, 45)
+    return score
+
+
 def momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating):
     score = 0.0
     if var_5d is not None and var_5d > 0:
@@ -1022,6 +1077,8 @@ def momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accel
         score += 5
     if accelerating:
         score += 8
+    if var_20d is not None and var_20d > HIGHLIGHT_SWEET_VAR20_MAX:
+        score -= min((var_20d - HIGHLIGHT_SWEET_VAR20_MAX) * 1.5, 35)
     return round(min(max(score, 0), 100), 0)
 
 
@@ -1054,8 +1111,8 @@ def analyst_score(is_buy, target_upside, price, finnhub):
     return round(min(max(score, 0), 100), 0)
 
 
-def options_score(top_vol_oi):
-    if not top_vol_oi:
+def options_score(top_vol_oi, var_1d=None, var_20d=None):
+    if not top_vol_oi or not _whale_signal_quality(var_1d, var_20d):
         return 0
     if top_vol_oi >= 15:
         return 100
@@ -1083,7 +1140,7 @@ def compute_scores(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accel
     )
     m = momentum_score(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating)
     a = analyst_score(is_buy, target_upside, price, finnhub)
-    o = options_score(top_vol_oi)
+    o = options_score(top_vol_oi, var_1d, var_20d)
     s = sentiment_score(finnhub)
     return m, a, o, s, global_score(m, a, o, s)
 
@@ -1219,7 +1276,7 @@ def enrich_with_finnhub(df_runners, df_stealth, df_extended, df_momentum=None):
         for _, row in df.iterrows():
             r = row.to_dict()
             meta = fh.get(r["Ticker"], {})
-            top_vol_oi = r.get("TopVolOI")
+            top_vol_oi = _effective_whale_vol_oi(r, top_vol_oi=r.get("TopVolOI"))
             m, a, o, s, g = compute_scores(
                 r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
                 r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
@@ -1303,10 +1360,7 @@ def apply_options_scores(df, options_map):
     rows = []
     for _, row in df.iterrows():
         r = row.to_dict()
-        top_vol_oi = None
-        contracts = options_map.get(r["Ticker"])
-        if contracts:
-            top_vol_oi = contracts[0]["vol_oi"]
+        top_vol_oi = _effective_whale_vol_oi(r, options_map)
         m, a, o, s, g = compute_scores(
             r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
             r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
@@ -1393,7 +1447,7 @@ def build_stealth_df(df_pool, options_map):
         return pd.DataFrame()
     rows = []
     for _, row in df_pool.iterrows():
-        if row["Var1j"] <= STEALTH_MIN_VAR1D:
+        if not _whale_signal_quality(row["Var1j"], row["Var20j"]):
             continue
         contracts = options_map.get(row["Ticker"])
         if not contracts:
@@ -1410,7 +1464,7 @@ def build_stealth_df(df_pool, options_map):
 
 
 def build_stock_highlights(df_runners, df_stealth, df_x2):
-    """Top actions uniques — max HIGHLIGHT_MAX_STOCKS."""
+    """Top actions uniques — max HIGHLIGHT_MAX_STOCKS (FH min, pas trop étendu)."""
     best = {}
     for signal, df in (("runner", df_runners), ("furtif", df_stealth), ("x2", df_x2)):
         if df is None or df.empty:
@@ -1421,7 +1475,8 @@ def build_stock_highlights(df_runners, df_stealth, df_x2):
             ticker = r["Ticker"]
             if ticker not in best or r.get("Score", 0) > best[ticker].get("Score", 0):
                 best[ticker] = r
-    ranked = sorted(best.values(), key=lambda x: x.get("Score", 0), reverse=True)
+    candidates = [r for r in best.values() if _passes_highlight_gate(r)]
+    ranked = sorted(candidates, key=_highlight_rank_score, reverse=True)
     return ranked[:HIGHLIGHT_MAX_STOCKS]
 
 
@@ -1461,10 +1516,10 @@ def _format_compact_stock(row, options_map=None, stealth=False):
     elif up is not None and not pd.isna(up):
         parts.append(f"Tgt +{up:.0f}%")
     if options_map:
-        contracts = options_map.get(row["Ticker"])
-        if contracts:
+        vol_oi = _effective_whale_vol_oi(row, options_map)
+        if vol_oi is not None:
             icon = "🕵️" if stealth else "🐳"
-            parts.append(f"{icon}{contracts[0]['vol_oi']:.1f}x")
+            parts.append(f"{icon}{vol_oi:.1f}x")
     return " | ".join(parts) + "\n"
 
 
@@ -1625,10 +1680,10 @@ def _format_highlight_stock(row, options_map):
     if news is not None and news != 50:
         parts.append(f"News {news:.0f}")
 
-    contracts = options_map.get(row["Ticker"])
-    if contracts:
+    vol_oi = _effective_whale_vol_oi(row, options_map, row.get("TopVolOI"))
+    if vol_oi is not None:
         icon = "🕵️" if row.get("Signal") == "furtif" else "🐳"
-        parts.append(f"{icon} {contracts[0]['vol_oi']:.1f}x")
+        parts.append(f"{icon} {vol_oi:.1f}x")
 
     line = " | ".join(parts)
     catalyst = future_catalyst_only(row.get("Catalyst"))
