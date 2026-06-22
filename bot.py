@@ -3,6 +3,8 @@ import re
 import json
 import time
 import logging
+import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 import requests
 import warnings
@@ -49,6 +51,8 @@ ANALYST_TARGET_MIN_UPSIDE = 30.0
 BUY_RATINGS = {"buy", "strong_buy", "strongbuy", "outperform", "overweight"}
 RUNNER_MAX_DOWNLOAD = 120
 HIGHLIGHT_MAX_STOCKS = 4
+HIGHLIGHT_X2_SLOTS = 2
+HIGHLIGHT_RUNNER_SLOTS = 2
 HIGHLIGHT_MAX_ETFS = 2
 STEALTH_SCAN_CAP = 12
 EXTENDED_MIN_PRICE = 3.0
@@ -113,7 +117,17 @@ HIGHLIGHT_MIN_FH_PCT = 30.0
 HIGHLIGHT_SWEET_VAR20_MAX = 35.0
 HIGHLIGHT_MAX_VAR20_HIGHLIGHTS = 48.0
 WHALE_MAX_VAR20 = 45.0
-WHALE_MIN_VAR1D = 0.0
+WHALE_MIN_VAR1D = 0.5
+
+META_CACHE_TTL_SEC = 3600
+SCAN_DISK_CACHE_TTL_SEC = 900
+OPTIONS_SCAN_MAX_TICKERS = 15
+FINNHUB_WORKERS = 6
+YAHOO_META_WORKERS = 8
+NEWS_CATALYST_MAX_AGE_DAYS = 7
+BIOTECH_PRE_CATALYST_MAX_VAR20 = 30.0
+BIOTECH_PRE_CATALYST_SCAN_CAP = 25
+HTTP_RETRIES = 2
 
 X2_MIN_TARGET_UPSIDE = 50.0
 X2_STRONG_TARGET_UPSIDE = 80.0
@@ -167,6 +181,8 @@ OPTIONS_DELAY_SEC = 0.25
 OPTIONS_CONTRACTS_PER_TICKER = 2
 
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+SCAN_DISK_CACHE_FILE = os.path.join(CACHE_DIR, "market_scan.pkl")
 
 
 def _welcome_message(chat_id):
@@ -178,6 +194,69 @@ def _welcome_message(chat_id):
     )
 SCAN_CACHE_TTL_SEC = 900
 _scan_cache = {"ts": 0, "data": None}
+
+
+def _load_pickle_cache(path, ttl_sec):
+    try:
+        if not os.path.isfile(path):
+            return None
+        if time.time() - os.path.getmtime(path) > ttl_sec:
+            return None
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _save_pickle_cache(path, data):
+    os.makedirs(os.path.dirname(path) or CACHE_DIR, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+
+
+def _http_get(url, params=None, timeout=10, retries=HTTP_RETRIES):
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.ok:
+                return resp
+        except requests.RequestException:
+            pass
+        if attempt < retries:
+            time.sleep(0.35 * (attempt + 1))
+    return None
+
+
+def _safe_num(val, default=0):
+    if val is None:
+        return default
+    try:
+        if pd.isna(val):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return val
+
+
+def _effective_target_upside(price, yahoo_upside, fh_meta):
+    upsides = []
+    if yahoo_upside is not None and not pd.isna(yahoo_upside):
+        upsides.append(float(yahoo_upside))
+    pt = (fh_meta or {}).get("price_target")
+    if pt and price and float(price) > 0:
+        upsides.append((float(pt) / float(price) - 1) * 100)
+    return max(upsides) if upsides else None
+
+
+def _row_qualifies_x2(row):
+    up = row.get("TargetUpside")
+    rb = row.get("RecBuyPct")
+    if up is not None and not pd.isna(up) and float(up) >= X2_STRONG_TARGET_UPSIDE:
+        return True
+    if up is not None and not pd.isna(up) and float(up) >= X2_MIN_TARGET_UPSIDE:
+        if row.get("AnalystBuy") or (rb is not None and not pd.isna(rb) and float(rb) >= 60):
+            return True
+    return False
 
 
 def to_yahoo_symbol(symbol: str) -> str:
@@ -331,7 +410,7 @@ def _handle_menu_action(chat_id, action_key, skip_pending_msg=False):
     if not skip_pending_msg:
         send_to_chat(chat_id, "⏳ <i>Analyse en cours…</i>")
     try:
-        scan = get_scan_data(force=True)
+        scan = get_scan_data(force=False)
         formatters = {
             "highlights": lambda: format_highlights_telegram(
                 scan["stock_highlights"], scan["etf_highlights"], scan["spy_ret_20d"], scan["options_map"],
@@ -674,7 +753,7 @@ def download_chunked(tickers, period="3mo"):
         chunk = yahoo_tickers[i : i + CHUNK_SIZE]
         log(f"   Lot {i // CHUNK_SIZE + 1}/{(len(yahoo_tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE} ({len(chunk)} tickers)...")
         try:
-            data = yf.download(chunk, period=period, progress=False, ignore_tz=True, threads=False, auto_adjust=True)
+            data = yf.download(chunk, period=period, progress=False, ignore_tz=True, threads=True, auto_adjust=True)
         except Exception:
             fail += len(chunk)
             time.sleep(CHUNK_DELAY_SEC)
@@ -725,15 +804,18 @@ def annualized_volatility(closes, days=30):
     return float(rets.std() * (252 ** 0.5) * 100)
 
 
-def risk_level(beta, short_pct, vol_30d):
+def risk_level(beta, short_pct, vol_30d, category=None):
     """Risque composite : beta, short interest, volatilité 30j → Faible / Moyen / Élevé."""
     points = 0
     components = 0
+    is_biotech = category == "Biotech"
     if beta is not None:
         components += 1
-        if beta >= 1.8:
+        beta_hi = 2.2 if is_biotech else 1.8
+        beta_mid = 1.5 if is_biotech else 1.2
+        if beta >= beta_hi:
             points += 2
-        elif beta >= 1.2:
+        elif beta >= beta_mid:
             points += 1
     if short_pct is not None:
         components += 1
@@ -743,9 +825,11 @@ def risk_level(beta, short_pct, vol_30d):
             points += 1
     if vol_30d is not None:
         components += 1
-        if vol_30d >= 70:
+        vol_hi = 90 if is_biotech else 70
+        vol_mid = 60 if is_biotech else 45
+        if vol_30d >= vol_hi:
             points += 2
-        elif vol_30d >= 45:
+        elif vol_30d >= vol_mid:
             points += 1
     if components == 0:
         return "Moyen", "🟠"
@@ -809,17 +893,30 @@ def _parse_catalyst_event_date(catalyst, ref=None):
         return None
 
 
-def future_catalyst_only(catalyst, ref=None):
-    """Garde le catalyseur seulement s'il est à venir ou sans date (FDA, PDUFA, Phase III…)."""
+def _article_date(article, ref=None):
+    ts = article.get("datetime")
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts)).date()
+    except (ValueError, OSError, TypeError):
+        return None
+
+
+def future_catalyst_only(catalyst, ref=None, source_date=None):
+    """Garde le catalyseur seulement s'il est à venir ou récent (news sans date événement)."""
     if not catalyst:
         return None
     text = str(catalyst).strip()
     if not text:
         return None
+    ref = ref or date.today()
     event_date = _parse_catalyst_event_date(text, ref)
     if event_date is None:
+        if source_date is not None and (ref - source_date).days > NEWS_CATALYST_MAX_AGE_DAYS:
+            return None
         return text
-    if event_date >= (ref or date.today()):
+    if event_date >= ref:
         return text
     return None
 
@@ -836,168 +933,221 @@ def sentiment_score(finnhub):
     return 50
 
 
+def _empty_analyst_entry():
+    return {
+        "recommendation": "", "is_buy": False, "target": None,
+        "upside_pct": None, "market_cap": None, "sector": "", "industry": "", "category": "Autre",
+        "beta": None, "short_pct": None, "earnings_date": None,
+    }
+
+
+def _fetch_one_analyst(ticker):
+    entry = _empty_analyst_entry()
+    try:
+        info = yf.Ticker(to_yahoo_symbol(ticker)).info
+        rec = (info.get("recommendationKey") or "").lower()
+        target = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        sector, industry = info.get("sector") or "", info.get("industry") or ""
+        beta = info.get("beta")
+        short_pct = info.get("shortPercentOfFloat") or info.get("shortRatio")
+        if short_pct is not None and short_pct <= 1:
+            short_pct = float(short_pct) * 100
+        earnings_ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
+        entry.update({
+            "recommendation": rec,
+            "is_buy": rec in BUY_RATINGS,
+            "market_cap": info.get("marketCap"),
+            "sector": sector,
+            "industry": industry,
+            "category": classify_sector(sector, industry),
+            "beta": float(beta) if beta is not None else None,
+            "short_pct": float(short_pct) if short_pct is not None else None,
+            "earnings_date": format_earnings_date(earnings_ts),
+        })
+        if target and price and float(price) > 0:
+            entry["target"] = float(target)
+            entry["upside_pct"] = (float(target) / float(price) - 1) * 100
+    except Exception:
+        pass
+    return entry
+
+
 def fetch_analyst_meta(tickers):
     log(f"📊 Métadonnées Yahoo ({len(tickers)} tickers)...")
     meta = {}
-    for i, ticker in enumerate(tickers, 1):
-        entry = {
-            "recommendation": "", "is_buy": False, "target": None,
-            "upside_pct": None, "market_cap": None, "sector": "", "industry": "", "category": "Autre",
-            "beta": None, "short_pct": None, "earnings_date": None,
-        }
-        try:
-            info = yf.Ticker(to_yahoo_symbol(ticker)).info
-            rec = (info.get("recommendationKey") or "").lower()
-            target = info.get("targetMeanPrice") or info.get("targetMedianPrice")
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-            sector, industry = info.get("sector") or "", info.get("industry") or ""
-            beta = info.get("beta")
-            short_pct = info.get("shortPercentOfFloat") or info.get("shortRatio")
-            if short_pct is not None and short_pct <= 1:
-                short_pct = float(short_pct) * 100
-            earnings_ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-            entry.update({
-                "recommendation": rec,
-                "is_buy": rec in BUY_RATINGS,
-                "market_cap": info.get("marketCap"),
-                "sector": sector,
-                "industry": industry,
-                "category": classify_sector(sector, industry),
-                "beta": float(beta) if beta is not None else None,
-                "short_pct": float(short_pct) if short_pct is not None else None,
-                "earnings_date": format_earnings_date(earnings_ts),
-            })
-            if target and price and float(price) > 0:
-                entry["target"] = float(target)
-                entry["upside_pct"] = (float(target) / float(price) - 1) * 100
-        except Exception:
-            pass
-        meta[ticker] = entry
-        if i % 25 == 0:
-            time.sleep(0.3)
+    to_fetch = []
+    yahoo_cache_dir = os.path.join(CACHE_DIR, "yahoo")
+    for ticker in tickers:
+        cache_path = os.path.join(yahoo_cache_dir, f"{ticker}.pkl")
+        cached = _load_pickle_cache(cache_path, META_CACHE_TTL_SEC)
+        if cached:
+            meta[ticker] = cached
+        else:
+            to_fetch.append(ticker)
+
+    if to_fetch:
+        workers = min(YAHOO_META_WORKERS, len(to_fetch))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_fetch_one_analyst, t): t for t in to_fetch}
+            for fut in as_completed(futures):
+                ticker = futures[fut]
+                try:
+                    entry = fut.result()
+                except Exception:
+                    entry = _empty_analyst_entry()
+                meta[ticker] = entry
+                _save_pickle_cache(os.path.join(yahoo_cache_dir, f"{ticker}.pkl"), entry)
+
     log(f"   {sum(1 for m in meta.values() if m['is_buy'])} Buy (Yahoo)")
     return meta
 
 
-def fetch_finnhub_meta(tickers):
-    """Finnhub — finalistes : reco, news, social, price target, alertes FDA."""
-    empty = {
+def _empty_finnhub_entry():
+    return {
         "rec_buy_pct": None, "news_score": None, "news_pct": None,
         "bullish_pct": None, "bearish_pct": None,
         "social_score": None, "social_pct": None,
         "price_target": None, "price_target_upside": None,
-        "negative_fda_news": False, "catalyst": None, "finnhub_ok": False,
+        "negative_fda_news": False, "catalyst": None, "catalyst_article_date": None,
+        "finnhub_ok": False,
     }
+
+
+def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, social_to):
+    entry = _empty_finnhub_entry()
+    params = {"symbol": ticker, "token": FINNHUB_API_KEY}
+    try:
+        rec_resp = _http_get(f"{FINNHUB_BASE}/stock/recommendation", params=params)
+        if rec_resp:
+            rec_data = rec_resp.json()
+            if isinstance(rec_data, list) and rec_data:
+                latest = rec_data[0]
+                buy = int(latest.get("buy", 0) or 0) + int(latest.get("strongBuy", 0) or 0)
+                total = buy + int(latest.get("hold", 0) or 0) + int(latest.get("sell", 0) or 0) + int(latest.get("strongSell", 0) or 0)
+                if total > 0:
+                    entry["rec_buy_pct"] = round(100 * buy / total, 1)
+
+        news_resp = _http_get(f"{FINNHUB_BASE}/news-sentiment", params=params)
+        if news_resp:
+            news = news_resp.json()
+            ns = news.get("companyNewsScore")
+            entry["news_score"] = ns
+            if ns is not None:
+                entry["news_pct"] = round(float(ns) * 100, 0)
+            sent = news.get("sentiment") or {}
+            entry["bullish_pct"] = sent.get("bullishPercent")
+            entry["bearish_pct"] = sent.get("bearishPercent")
+
+        social_resp = _http_get(
+            f"{FINNHUB_BASE}/stock/social-sentiment",
+            params={**params, "from": social_from, "to": social_to},
+        )
+        if social_resp:
+            social_data = social_resp.json()
+            items = social_data if isinstance(social_data, list) else social_data.get("data", [])
+            if items:
+                scores = [float(x.get("score", 0) or 0) for x in items if x.get("score") is not None]
+                if scores:
+                    avg = sum(scores) / len(scores)
+                    entry["social_score"] = round(avg, 3)
+                    entry["social_pct"] = round(min(max((avg + 1) / 2 * 100, 0), 100), 0)
+
+        pt_resp = _http_get(f"{FINNHUB_BASE}/stock/price-target", params=params)
+        if pt_resp:
+            pt = pt_resp.json()
+            target = pt.get("targetMean") or pt.get("targetHigh")
+            if target:
+                entry["price_target"] = float(target)
+
+        cn_resp = _http_get(
+            f"{FINNHUB_BASE}/company-news",
+            params={**params, "from": news_from, "to": news_to},
+        )
+        if cn_resp:
+            for article in cn_resp.json() or []:
+                art_date = _article_date(article, today)
+                if art_date and (today - art_date).days > NEWS_CATALYST_MAX_AGE_DAYS:
+                    continue
+                headline = article.get("headline") or ""
+                summary = article.get("summary") or ""
+                text = f"{headline} {summary}"
+                text_l = text.lower()
+                if any(kw in text_l for kw in FDA_NEGATIVE_KW):
+                    entry["negative_fda_news"] = True
+                if not entry["catalyst"]:
+                    cat = detect_catalyst_from_text(text)
+                    if cat:
+                        entry["catalyst"] = cat
+                        entry["catalyst_article_date"] = art_date
+                        if cat == "Résultats / guidance" and headline:
+                            entry["catalyst"] = f"{cat} — {headline[:60]}"
+
+        earn_resp = _http_get(
+            f"{FINNHUB_BASE}/calendar/earnings",
+            params={**params, "from": today.isoformat(), "to": (today + timedelta(days=120)).isoformat()},
+        )
+        if earn_resp and not entry.get("catalyst"):
+            for ev in earn_resp.json() or []:
+                if (ev.get("symbol") or "").upper() != ticker:
+                    continue
+                ed = ev.get("date") or ev.get("period")
+                if not ed:
+                    entry["catalyst"] = "Résultats à venir"
+                    break
+                try:
+                    ed_date = datetime.strptime(str(ed)[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    ed_date = None
+                if ed_date is None or ed_date >= today:
+                    entry["catalyst"] = f"Résultats le {ed}"
+                    break
+        entry["catalyst"] = future_catalyst_only(
+            entry.get("catalyst"), today, entry.get("catalyst_article_date"),
+        )
+        entry["finnhub_ok"] = True
+    except Exception as e:
+        log(f"   ⚠️ Finnhub {ticker}: {e}")
+    return ticker, entry
+
+
+def fetch_finnhub_meta(tickers):
+    """Finnhub — finalistes : reco, news, social, price target, alertes FDA."""
     if not FINNHUB_API_KEY:
         log("📊 Finnhub : clé absente — sentiment ignoré")
-        return {t: dict(empty) for t in tickers}
+        return {t: dict(_empty_finnhub_entry()) for t in tickers}
 
     log(f"📊 Finnhub sentiment ({len(tickers)} finalistes)...")
-    meta = {}
     today = datetime.now().date()
     news_from = (today - timedelta(days=NEWS_LOOKBACK_DAYS)).isoformat()
     social_from = (today - timedelta(days=7)).isoformat()
     news_to = social_to = today.isoformat()
 
-    for i, ticker in enumerate(tickers, 1):
-        entry = dict(empty)
-        params = {"symbol": ticker, "token": FINNHUB_API_KEY}
-        try:
-            rec_resp = requests.get(f"{FINNHUB_BASE}/stock/recommendation", params=params, timeout=10)
-            if rec_resp.ok:
-                rec_data = rec_resp.json()
-                if isinstance(rec_data, list) and rec_data:
-                    latest = rec_data[0]
-                    buy = int(latest.get("buy", 0) or 0) + int(latest.get("strongBuy", 0) or 0)
-                    total = buy + int(latest.get("hold", 0) or 0) + int(latest.get("sell", 0) or 0) + int(latest.get("strongSell", 0) or 0)
-                    if total > 0:
-                        entry["rec_buy_pct"] = round(100 * buy / total, 1)
-            time.sleep(FINNHUB_DELAY_SEC)
+    meta = {}
+    fh_cache_dir = os.path.join(CACHE_DIR, "finnhub")
+    to_fetch = []
+    for ticker in tickers:
+        cache_path = os.path.join(fh_cache_dir, f"{ticker}.pkl")
+        cached = _load_pickle_cache(cache_path, META_CACHE_TTL_SEC)
+        if cached:
+            meta[ticker] = cached
+        else:
+            to_fetch.append(ticker)
 
-            news_resp = requests.get(f"{FINNHUB_BASE}/news-sentiment", params=params, timeout=10)
-            if news_resp.ok:
-                news = news_resp.json()
-                ns = news.get("companyNewsScore")
-                entry["news_score"] = ns
-                if ns is not None:
-                    entry["news_pct"] = round(float(ns) * 100, 0)
-                sent = news.get("sentiment") or {}
-                entry["bullish_pct"] = sent.get("bullishPercent")
-                entry["bearish_pct"] = sent.get("bearishPercent")
-            time.sleep(FINNHUB_DELAY_SEC)
+    if to_fetch:
+        workers = min(FINNHUB_WORKERS, len(to_fetch))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_one_finnhub_meta, t, today, news_from, social_from, news_to, social_to,
+                )
+                for t in to_fetch
+            ]
+            for fut in as_completed(futures):
+                ticker, entry = fut.result()
+                meta[ticker] = entry
+                _save_pickle_cache(os.path.join(fh_cache_dir, f"{ticker}.pkl"), entry)
 
-            social_resp = requests.get(
-                f"{FINNHUB_BASE}/stock/social-sentiment",
-                params={**params, "from": social_from, "to": social_to},
-                timeout=10,
-            )
-            if social_resp.ok:
-                social_data = social_resp.json()
-                items = social_data if isinstance(social_data, list) else social_data.get("data", [])
-                if items:
-                    scores = [float(x.get("score", 0) or 0) for x in items if x.get("score") is not None]
-                    if scores:
-                        avg = sum(scores) / len(scores)
-                        entry["social_score"] = round(avg, 3)
-                        entry["social_pct"] = round(min(max((avg + 1) / 2 * 100, 0), 100), 0)
-            time.sleep(FINNHUB_DELAY_SEC)
-
-            pt_resp = requests.get(f"{FINNHUB_BASE}/stock/price-target", params=params, timeout=10)
-            if pt_resp.ok:
-                pt = pt_resp.json()
-                target = pt.get("targetMean") or pt.get("targetHigh")
-                if target:
-                    entry["price_target"] = float(target)
-            time.sleep(FINNHUB_DELAY_SEC)
-
-            cn_resp = requests.get(
-                f"{FINNHUB_BASE}/company-news",
-                params={**params, "from": news_from, "to": news_to},
-                timeout=10,
-            )
-            if cn_resp.ok:
-                for article in cn_resp.json() or []:
-                    headline = article.get("headline") or ""
-                    summary = article.get("summary") or ""
-                    text = f"{headline} {summary}"
-                    text_l = text.lower()
-                    if any(kw in text_l for kw in FDA_NEGATIVE_KW):
-                        entry["negative_fda_news"] = True
-                    if not entry["catalyst"]:
-                        cat = detect_catalyst_from_text(text)
-                        if cat:
-                            entry["catalyst"] = cat
-                            if cat == "Résultats / guidance" and headline:
-                                entry["catalyst"] = f"{cat} — {headline[:60]}"
-            time.sleep(FINNHUB_DELAY_SEC)
-
-            earn_resp = requests.get(
-                f"{FINNHUB_BASE}/calendar/earnings",
-                params={**params, "from": today.isoformat(), "to": (today + timedelta(days=120)).isoformat()},
-                timeout=10,
-            )
-            if earn_resp.ok and not entry.get("catalyst"):
-                for ev in earn_resp.json() or []:
-                    if (ev.get("symbol") or "").upper() != ticker:
-                        continue
-                    ed = ev.get("date") or ev.get("period")
-                    if not ed:
-                        entry["catalyst"] = "Résultats à venir"
-                        break
-                    try:
-                        ed_date = datetime.strptime(str(ed)[:10], "%Y-%m-%d").date()
-                    except ValueError:
-                        ed_date = None
-                    if ed_date is None or ed_date >= today:
-                        entry["catalyst"] = f"Résultats le {ed}"
-                        break
-            entry["catalyst"] = future_catalyst_only(entry.get("catalyst"), today)
-            entry["finnhub_ok"] = True
-        except Exception as e:
-            log(f"   ⚠️ Finnhub {ticker}: {e}")
-        meta[ticker] = entry
-        if i % 8 == 0:
-            time.sleep(0.5)
     ok = sum(1 for m in meta.values() if m["finnhub_ok"])
     log(f"   Finnhub OK : {ok}/{len(tickers)}")
     return meta
@@ -1045,6 +1195,17 @@ def _passes_highlight_gate(row):
     if _safe_num(row.get("Var20j"), 0) > HIGHLIGHT_MAX_VAR20_HIGHLIGHTS:
         return False
     return True
+
+
+def filter_quality_df(df):
+    """Applique les filtres Highlights aux menus actions/runners."""
+    if df is None or df.empty:
+        return df
+    rows = [row.to_dict() for _, row in df.iterrows() if _passes_highlight_gate(row.to_dict())]
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    return out.sort_values(by=["Score", "Var20j"], ascending=False)
 
 
 def _highlight_rank_score(row):
@@ -1161,7 +1322,8 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
         analyst.get("is_buy", False), analyst.get("upside_pct"), price, fh, top_vol_oi,
     )
     beta, short_pct = analyst.get("beta"), analyst.get("short_pct")
-    risk_label, risk_emoji = risk_level(beta, short_pct, vol_30d)
+    category = analyst.get("category", "Autre")
+    risk_label, risk_emoji = risk_level(beta, short_pct, vol_30d, category)
     catalyst = future_catalyst_only(fh.get("catalyst"))
     if not catalyst and analyst.get("earnings_date"):
         catalyst = future_catalyst_only(f"Résultats le {analyst['earnings_date']}")
@@ -1198,8 +1360,33 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
     }
 
 
-def analyze_candidates(tickers, sources, spy_ret_20d):
+def fetch_fda_calendar_tickers(nasdaq_stocks):
+    """Symboles US avec événement FDA à venir (univers pré-catalyseur biotech)."""
+    if not FINNHUB_API_KEY:
+        return []
+    today = date.today()
+    end = today + timedelta(days=120)
+    resp = _http_get(
+        f"{FINNHUB_BASE}/fda-calendar",
+        params={"from": today.isoformat(), "to": end.isoformat(), "token": FINNHUB_API_KEY},
+        timeout=15,
+    )
+    if not resp:
+        return []
+    symbols = []
+    for ev in resp.json() or []:
+        sym = (ev.get("symbol") or "").strip().upper()
+        if sym and sym in nasdaq_stocks and SYMBOL_RE.match(sym):
+            symbols.append(sym)
+    symbols = list(dict.fromkeys(symbols))
+    if symbols:
+        log(f"🧬 FDA calendar : {len(symbols)} symboles pré-catalyseur")
+    return symbols
+
+
+def analyze_candidates(tickers, sources, spy_ret_20d, precatalyst_tickers=None):
     log(f"📡 Analyse momentum {len(tickers)} tickers...")
+    precatalyst_set = set(precatalyst_tickers or [])
     analyst_meta = fetch_analyst_meta(tickers)
     all_closes, all_volumes, ok, fail = download_chunked(tickers, period="3mo")
     log(f"   ✅ {ok} récupérés | ❌ {fail} échecs")
@@ -1233,6 +1420,16 @@ def analyze_candidates(tickers, sources, spy_ret_20d):
             continue
 
         if var_20d is None or var_20d < RUNNER_MIN_VAR20 or (rs_20d is not None and rs_20d < 0):
+            if (
+                ticker in precatalyst_set
+                and analyst.get("category") == "Biotech"
+                and (var_20d is None or var_20d <= BIOTECH_PRE_CATALYST_MAX_VAR20)
+                and price >= RUNNER_MIN_PRICE
+            ):
+                momentum_pool.append(_build_row(
+                    ticker, price, var_1d, var_5d, var_20d or 0, rs_20d or 0,
+                    vol_ratio, analyst, sources, {}, vol_30d,
+                ))
             continue
 
         momentum_pool.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, vol_30d))
@@ -1276,16 +1473,21 @@ def enrich_with_finnhub(df_runners, df_stealth, df_extended, df_momentum=None):
         for _, row in df.iterrows():
             r = row.to_dict()
             meta = fh.get(r["Ticker"], {})
+            target_upside = _effective_target_upside(r.get("Prix"), r.get("TargetUpside"), meta)
             top_vol_oi = _effective_whale_vol_oi(r, top_vol_oi=r.get("TopVolOI"))
             m, a, o, s, g = compute_scores(
                 r["Var1j"], r["Var5j"], r["Var20j"], r["RS20j"], r["VolRatio"],
                 r["Shorted"], r["Var5j"] > 0 and r["Var5j"] > r["Var20j"] / 4,
-                r["AnalystBuy"], r["TargetUpside"], r["Prix"], meta, top_vol_oi,
+                r["AnalystBuy"], target_upside, r["Prix"], meta, top_vol_oi,
             )
-            catalyst = future_catalyst_only(meta.get("catalyst") or r.get("Catalyst"))
+            catalyst = future_catalyst_only(
+                meta.get("catalyst") or r.get("Catalyst"),
+                source_date=meta.get("catalyst_article_date"),
+            )
             r.update({
                 "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
                 "SentimentScore": s, "Score": g,
+                "TargetUpside": target_upside,
                 "TopVolOI": top_vol_oi,
                 "NewsScore": meta.get("news_score"),
                 "NewsPct": meta.get("news_pct"),
@@ -1309,19 +1511,12 @@ def build_x2_df(df_momentum):
         return pd.DataFrame()
     rows = []
     for _, row in df_momentum.iterrows():
-        up = row.get("TargetUpside")
-        rb = row.get("RecBuyPct")
-        qualifies = False
-        if up is not None and up >= X2_STRONG_TARGET_UPSIDE:
-            qualifies = True
-        elif up is not None and up >= X2_MIN_TARGET_UPSIDE and (row.get("AnalystBuy") or (rb and rb >= 60)):
-            qualifies = True
-        if qualifies:
+        if _row_qualifies_x2(row.to_dict()):
             rows.append(row.to_dict())
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    return df.sort_values(by=["AnalystScore", "TargetUpside", "Score"], ascending=False)
+    return df.sort_values(by=["TargetUpside", "AnalystScore", "Score"], ascending=False)
 
 
 def analyze_etf_watchlist(spy_ret_20d):
@@ -1464,43 +1659,64 @@ def build_stealth_df(df_pool, options_map):
 
 
 def build_stock_highlights(df_runners, df_stealth, df_x2):
-    """Top actions uniques — max HIGHLIGHT_MAX_STOCKS (FH min, pas trop étendu)."""
-    best = {}
-    for signal, df in (("runner", df_runners), ("furtif", df_stealth), ("x2", df_x2)):
+    """Top actions — slots x2 dédiés + runners early-entry."""
+    x2_best = {}
+    for signal, df in (("x2", df_x2), ("runner", df_runners), ("furtif", df_stealth)):
         if df is None or df.empty:
             continue
         for _, row in df.iterrows():
             r = row.to_dict()
+            if not _passes_highlight_gate(r) or not _row_qualifies_x2(r):
+                continue
             r["Signal"] = signal
             ticker = r["Ticker"]
-            if ticker not in best or r.get("Score", 0) > best[ticker].get("Score", 0):
-                best[ticker] = r
-    candidates = [r for r in best.values() if _passes_highlight_gate(r)]
-    ranked = sorted(candidates, key=_highlight_rank_score, reverse=True)
-    return ranked[:HIGHLIGHT_MAX_STOCKS]
+            up = _safe_num(r.get("TargetUpside"), 0)
+            prev = x2_best.get(ticker)
+            if not prev or up > _safe_num(prev.get("TargetUpside"), 0):
+                x2_best[ticker] = r
+
+    x2_picks = sorted(
+        x2_best.values(),
+        key=lambda r: (_safe_num(r.get("TargetUpside"), 0), _highlight_rank_score(r)),
+        reverse=True,
+    )[:HIGHLIGHT_X2_SLOTS]
+    picked = {r["Ticker"] for r in x2_picks}
+
+    runner_best = {}
+    for signal, df in (("runner", df_runners), ("furtif", df_stealth)):
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            r = row.to_dict()
+            if not _passes_highlight_gate(r) or _row_qualifies_x2(r):
+                continue
+            r["Signal"] = signal
+            ticker = r["Ticker"]
+            if ticker in picked:
+                continue
+            score = _highlight_rank_score(r)
+            prev = runner_best.get(ticker)
+            if not prev or score > _highlight_rank_score(prev):
+                runner_best[ticker] = r
+
+    runner_picks = sorted(runner_best.values(), key=_highlight_rank_score, reverse=True)[
+        :HIGHLIGHT_RUNNER_SLOTS
+    ]
+    return x2_picks + runner_picks
 
 
 def pick_etf_highlights(etf_data):
-    """Top ETF par RS 20j — max HIGHLIGHT_MAX_ETFS."""
+    """Top ETF par RS 20j — max 1 par groupe thématique."""
     rows = []
     for group, items in (etf_data or {}).items():
-        for row in items:
-            r = dict(row)
-            r["Group"] = group
-            rows.append(r)
+        if not items:
+            continue
+        best = max(items, key=lambda x: x.get("RS20j", 0))
+        r = dict(best)
+        r["Group"] = group
+        rows.append(r)
     rows.sort(key=lambda x: x.get("RS20j", 0), reverse=True)
     return rows[:HIGHLIGHT_MAX_ETFS]
-
-
-def _safe_num(val, default=0):
-    if val is None:
-        return default
-    try:
-        if pd.isna(val):
-            return default
-    except (TypeError, ValueError):
-        pass
-    return val
 
 
 def _format_compact_stock(row, options_map=None, stealth=False):
@@ -1531,6 +1747,7 @@ def _spy_header(spy_ret_20d):
 
 def format_actions_telegram(df_momentum, options_map, spy_ret_20d):
     message = f"<b>{MENU_LABELS['actions']}</b>\n{_spy_header(spy_ret_20d)}"
+    df_momentum = filter_quality_df(df_momentum)
     if df_momentum is None or df_momentum.empty:
         return message + "<i>Aucune action qualifiée.</i>\n"
     df = df_momentum.sort_values(by=["Score", "Var20j"], ascending=False)
@@ -1564,6 +1781,7 @@ def format_etfs_telegram(etf_data, spy_ret_20d):
 def format_runners_telegram(df_runners, options_map, spy_ret_20d):
     message = f"<b>{MENU_LABELS['runners']}</b>\n{_spy_header(spy_ret_20d)}"
     message += f"<i>Vol &gt;= {RUNNER_STRICT_VOL_RATIO}x et jour vert</i>\n"
+    df_runners = filter_quality_df(df_runners)
     if df_runners is None or df_runners.empty:
         return message + "<i>Aucun runner aujourd'hui.</i>\n"
     for _, row in df_runners.head(MENU_MAX_RUNNERS).iterrows():
@@ -1598,7 +1816,11 @@ def run_market_scan():
     """Pipeline complet — données pour tous les menus."""
     nasdaq_stocks, _ = fetch_nasdaq_trader_symbols()
     stock_quotes, sources = fetch_screener_universe()
-    tickers = build_runner_candidates(stock_quotes, nasdaq_stocks, sources)
+    runner_tickers = build_runner_candidates(stock_quotes, nasdaq_stocks, sources)
+    fda_tickers = fetch_fda_calendar_tickers(nasdaq_stocks)
+    precatalyst_set = set(fda_tickers)
+    extra = [t for t in fda_tickers if t not in runner_tickers][:BIOTECH_PRE_CATALYST_SCAN_CAP]
+    tickers = runner_tickers + extra
     if not tickers:
         raise RuntimeError("Aucun candidat screener.")
 
@@ -1606,12 +1828,21 @@ def run_market_scan():
     if spy_ret_20d is not None:
         log(f"📊 Benchmark SPY 20j : {spy_ret_20d:+.2f}%")
 
-    df_runners, df_stealth_pool, df_extended, df_momentum = analyze_candidates(tickers, sources, spy_ret_20d)
+    df_runners, df_stealth_pool, df_extended, df_momentum = analyze_candidates(
+        tickers, sources, spy_ret_20d, precatalyst_tickers=precatalyst_set,
+    )
 
     stealth_scan = df_stealth_pool.head(STEALTH_SCAN_CAP) if not df_stealth_pool.empty else df_stealth_pool
-    options_runners = scan_options_for_df(df_runners, "runners")
-    options_stealth = scan_options_for_df(stealth_scan, "furtif")
-    options_map = {**options_runners, **options_stealth}
+    options_targets = []
+    if not df_runners.empty:
+        options_targets.append(df_runners.head(OPTIONS_SCAN_MAX_TICKERS))
+    if not stealth_scan.empty:
+        options_targets.append(stealth_scan.head(OPTIONS_SCAN_MAX_TICKERS))
+    options_df = (
+        pd.concat(options_targets, ignore_index=True).drop_duplicates(subset=["Ticker"])
+        if options_targets else pd.DataFrame()
+    )
+    options_map = scan_options_for_df(options_df, "finalistes") if not options_df.empty else {}
 
     df_runners = apply_options_scores(df_runners, options_map)
     df_stealth = build_stealth_df(stealth_scan, options_map)
@@ -1656,10 +1887,20 @@ def get_scan_data(force=False):
         and _scan_cache["data"] is not None
         and time.time() - _scan_cache["ts"] < SCAN_CACHE_TTL_SEC
     ):
-        log("📦 Scan en cache (réutilisé)")
+        log("📦 Scan en cache mémoire (réutilisé)")
         return _scan_cache["data"]
+
+    if not force:
+        disk = _load_pickle_cache(SCAN_DISK_CACHE_FILE, SCAN_DISK_CACHE_TTL_SEC)
+        if disk and isinstance(disk.get("data"), dict):
+            log("📦 Scan en cache disque (réutilisé)")
+            _scan_cache = {"ts": disk.get("ts", time.time()), "data": disk["data"]}
+            return disk["data"]
+
     data = run_market_scan()
-    _scan_cache = {"ts": time.time(), "data": data}
+    ts = time.time()
+    _scan_cache = {"ts": ts, "data": data}
+    _save_pickle_cache(SCAN_DISK_CACHE_FILE, {"ts": ts, "data": data})
     return data
 
 
@@ -1684,6 +1925,8 @@ def _format_highlight_stock(row, options_map):
     if vol_oi is not None:
         icon = "🕵️" if row.get("Signal") == "furtif" else "🐳"
         parts.append(f"{icon} {vol_oi:.1f}x")
+    if row.get("Signal") == "x2" or _row_qualifies_x2(row):
+        parts.append("🎯 x2")
 
     line = " | ".join(parts)
     catalyst = future_catalyst_only(row.get("Catalyst"))
