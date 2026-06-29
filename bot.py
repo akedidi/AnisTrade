@@ -314,6 +314,18 @@ def _fmt_pct(val, decimals=0, signed=True):
     return f"{v:.{decimals}f} %"
 
 
+def _fmt_price(val):
+    """Prix actuel lisible (actions penny → grandes capitalisations)."""
+    if not _is_valid_num(val):
+        return None
+    p = float(val)
+    if p >= 100:
+        return f"{p:.0f} $"
+    if p >= 10:
+        return f"{p:.1f} $"
+    return f"{p:.2f} $"
+
+
 def _effective_target_upside(price, yahoo_upside, fh_meta):
     upsides = []
     if yahoo_upside is not None and not pd.isna(yahoo_upside):
@@ -1962,7 +1974,11 @@ def _format_compact_stock(row, options_map=None, stealth=False, highlight_ticker
     score = _display_score(row)
     risk = row.get("RiskEmoji", "🟠")
     var_s = _fmt_pct(row.get("Var20j"), 0) or "n/d"
-    parts = [f"{pin}<b>{ticker}</b>", f"Score {score} {risk}", f"{var_s} sur 20 j"]
+    parts = [f"{pin}<b>{ticker}</b>"]
+    prix_s = _fmt_price(row.get("Prix"))
+    if prix_s:
+        parts.append(prix_s)
+    parts.extend([f"Score {score} {risk}", f"{var_s} sur 20 j"])
     parts.extend(_format_analyst_parts(row))
     if options_map:
         vol_oi = _effective_whale_vol_oi(row, options_map, stealth=stealth)
@@ -2123,11 +2139,11 @@ def format_extended_telegram(df_extended, spy_ret_20d):
         return message + "<i>Aucune action dans cette catégorie aujourd'hui.</i>\n"
     for _, row in df_extended.head(MENU_MAX_EXTENDED).iterrows():
         var_s = _fmt_pct(row.get("Var20j"), 0) or "n/d"
-        prix = f"{float(row['Prix']):.0f} $" if _is_valid_num(row.get("Prix")) else "n/d"
+        prix = _fmt_price(row.get("Prix")) or "n/d"
         vol = f"×{float(row['VolRatio']):.1f}" if _is_valid_num(row.get("VolRatio")) else "n/d"
         message += (
             f"<b>{escape_html(row['Ticker'])}</b> "
-            f"{var_s} sur 20 j | {prix} | volume {vol}\n"
+            f"{prix} | {var_s} sur 20 j | volume {vol}\n"
         )
     return message + "\n⚠️ <i>Pas un conseil d'investissement.</i>"
 
@@ -2246,10 +2262,10 @@ def _format_highlight_etf(row, best=False):
     star = " ⭐" if best else ""
     var20 = _fmt_pct(row.get("Var20j"), 1) or "n/d"
     vs_marche = _fmt_pct(row.get("RS20j"), 1) or "n/d"
-    prix = f"{float(row.get('Prix')):.0f} $" if _is_valid_num(row.get("Prix")) else "n/d"
+    prix = _fmt_price(row.get("Prix")) or "n/d"
     return (
         f"<b>{escape_html(row['Ticker'])}</b>{star} "
-        f"{var20} sur 20 j | {vs_marche} vs marché US | {prix}\n"
+        f"{prix} | {var20} sur 20 j | {vs_marche} vs marché US\n"
     )
 
 
