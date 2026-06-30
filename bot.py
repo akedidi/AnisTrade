@@ -123,7 +123,7 @@ WHALE_MIN_VAR1D = 0.5
 META_CACHE_TTL_SEC = 3600
 SCAN_DISK_CACHE_TTL_SEC = 900
 OPTIONS_SCAN_MAX_TICKERS = 15
-FINNHUB_WORKERS = 6
+FINNHUB_WORKERS = 2
 YAHOO_META_WORKERS = 8
 NEWS_CATALYST_MAX_AGE_DAYS = 7
 BIOTECH_PRE_CATALYST_MAX_VAR20 = 30.0
@@ -135,7 +135,7 @@ X2_STRONG_TARGET_UPSIDE = 80.0
 
 CHUNK_SIZE = 80
 CHUNK_DELAY_SEC = 0.25
-FINNHUB_DELAY_SEC = 0.15
+FINNHUB_DELAY_SEC = 0.5
 NEWS_LOOKBACK_DAYS = 14
 
 SECTOR_ORDER = ["Biotech", "IA", "Sante", "Energie", "Autre"]
@@ -505,7 +505,7 @@ def _handle_menu_action(chat_id, action_key, skip_pending_msg=False):
             ),
             "actions": lambda: format_actions_telegram(
                 scan["df_momentum"], scan["options_map"], scan["spy_ret_20d"],
-                highlight_tickers=[r["Ticker"] for r in scan["stock_highlights"]],
+                highlight_tickers={r["Ticker"]: r.get("Signal", "") for r in scan["stock_highlights"]},
             ),
             "etfs": lambda: format_etfs_telegram(
                 scan["etf_data"], scan["spy_ret_20d"], etf_highlights=scan["etf_highlights"],
@@ -1139,6 +1139,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
                 total = buy + int(latest.get("hold", 0) or 0) + int(latest.get("sell", 0) or 0) + int(latest.get("strongSell", 0) or 0)
                 if total > 0:
                     entry["rec_buy_pct"] = round(100 * buy / total, 1)
+        time.sleep(FINNHUB_DELAY_SEC)
 
         news_resp = _http_get(f"{FINNHUB_BASE}/news-sentiment", params=params)
         if news_resp:
@@ -1152,6 +1153,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
                 sent = {}
             entry["bullish_pct"] = sent.get("bullishPercent")
             entry["bearish_pct"] = sent.get("bearishPercent")
+        time.sleep(FINNHUB_DELAY_SEC)
 
         social_resp = _http_get(
             f"{FINNHUB_BASE}/stock/social-sentiment",
@@ -1170,6 +1172,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
                     avg = sum(scores) / len(scores)
                     entry["social_score"] = round(avg, 3)
                     entry["social_pct"] = round(min(max((avg + 1) / 2 * 100, 0), 100), 0)
+        time.sleep(FINNHUB_DELAY_SEC)
 
         pt_resp = _http_get(f"{FINNHUB_BASE}/stock/price-target", params=params)
         if pt_resp:
@@ -1177,6 +1180,7 @@ def _fetch_one_finnhub_meta(ticker, today, news_from, social_from, news_to, soci
             target = pt.get("targetMean") or pt.get("targetHigh")
             if target:
                 entry["price_target"] = float(target)
+        time.sleep(FINNHUB_DELAY_SEC)
 
         cn_resp = _http_get(
             f"{FINNHUB_BASE}/company-news",
@@ -1253,7 +1257,7 @@ def fetch_finnhub_meta(tickers):
     for ticker in tickers:
         cache_path = os.path.join(fh_cache_dir, f"{ticker}.pkl")
         cached = _load_pickle_cache(cache_path, META_CACHE_TTL_SEC)
-        if cached:
+        if cached and cached.get("finnhub_ok"):
             meta[ticker] = cached
         else:
             to_fetch.append(ticker)
@@ -1325,12 +1329,12 @@ def _effective_whale_vol_oi(row, options_map=None, top_vol_oi=None, stealth=Fals
 
 
 def _format_analyst_parts(row):
-    """FH (consensus analystes Finnhub) + Target (upside prix cible) — complémentaires."""
+    """Consensus achat (Finnhub) + upside prix cible (Yahoo/Finnhub)."""
     parts = []
     rb = row.get("RecBuyPct")
     up = row.get("TargetUpside")
     if _is_valid_num(rb):
-        parts.append(f"FH {float(rb):.0f} %")
+        parts.append(f"Consensus achat {float(rb):.0f} %")
     if _is_valid_num(up):
         tgt = _format_target_upside(up)
         if tgt:
@@ -1342,7 +1346,15 @@ def _format_analyst_parts(row):
 
 def _format_target_upside(up):
     pct = _fmt_pct(up, decimals=0, signed=True)
-    return f"Objectif analystes {pct}" if pct else None
+    return f"Cible analystes {pct}" if pct else None
+
+
+def _analyst_legend():
+    return (
+        "<i>Consensus achat = part des analystes qui recommandent l'achat · "
+        "Cible analystes = hausse potentielle jusqu'au prix cible moyen "
+        "(par rapport au prix actuel).</i>\n"
+    )
 
 
 def _passes_runner_highlight_slot(row):
@@ -1968,9 +1980,14 @@ def pick_etf_highlights(etf_data):
 
 
 def _format_compact_stock(row, options_map=None, stealth=False, highlight_tickers=None):
-    """Une ligne action lisible — utilisée par tous les menus."""
+    """Une ligne action lisible — utilisée par tous les menus.
+
+    highlight_tickers peut être un set (rétro-compat) ou un dict {ticker: signal}.
+    """
     ticker = escape_html(row["Ticker"])
-    pin = "⭐ " if highlight_tickers and row["Ticker"] in highlight_tickers else ""
+    raw_ticker = row["Ticker"]
+    is_hl = highlight_tickers and raw_ticker in highlight_tickers
+    pin = "⭐ " if is_hl else ""
     score = _display_score(row)
     risk = row.get("RiskEmoji", "🟠")
     var_s = _fmt_pct(row.get("Var20j"), 0) or "n/d"
@@ -1987,6 +2004,10 @@ def _format_compact_stock(row, options_map=None, stealth=False, highlight_ticker
                 parts.append(f"🕵️ gros CALL options (×{float(vol_oi):.1f})")
             else:
                 parts.append(f"🐳 options actives (×{float(vol_oi):.1f})")
+    # Signal x2 : soit dans la row elle-même, soit dans le dict highlight_tickers
+    signal = row.get("Signal") or (highlight_tickers.get(raw_ticker) if isinstance(highlight_tickers, dict) else None)
+    if signal == "x2":
+        parts.append("🎯 x2")
     catalyst = future_catalyst_only(row.get("Catalyst"))
     line = " | ".join(parts)
     if catalyst and str(catalyst).strip().lower() not in ("nan", "none", "nat"):
@@ -2032,8 +2053,9 @@ def format_actions_telegram(df_momentum, options_map, spy_ret_20d, highlight_tic
         f"<b>{MENU_LABELS['actions']}</b>\n"
         f"{_spy_header(spy_ret_20d)}"
         "<i>Meilleures actions par secteur (⭐ = aussi dans Highlights).</i>\n"
+        f"{_analyst_legend()}"
     )
-    highlight_tickers = set(highlight_tickers or [])
+    highlight_tickers = highlight_tickers if isinstance(highlight_tickers, dict) else set(highlight_tickers or [])
     df_momentum = filter_quality_df(df_momentum)
     if df_momentum is None or df_momentum.empty:
         return message + "<i>Aucune action qualifiée.</i>\n"
@@ -2081,7 +2103,8 @@ def format_runners_telegram(df_runners, options_map, spy_ret_20d, stock_highligh
     message = (
         f"<b>{MENU_LABELS['runners']}</b>\n"
         f"{_spy_header(spy_ret_20d)}"
-        "<i>Actions avec fort volume et journée positive — le mouvement est visible.</i>\n\n"
+        "<i>Actions avec fort volume et journée positive — le mouvement est visible.</i>\n"
+        f"{_analyst_legend()}\n"
     )
     hl_tickers = {r["Ticker"] for r in (stock_highlights or [])}
     if stock_highlights:
@@ -2114,7 +2137,8 @@ def format_furtifs_telegram(df_stealth, options_map, spy_ret_20d, df_stealth_poo
         f"<b>🕵️ Achats furtifs</b>\n"
         f"{_spy_header(spy_ret_20d)}"
         "<i>Parieurs options actifs alors que l'action bouge peu "
-        "(signe d'un pari avant un mouvement).</i>\n\n"
+        "(signe d'un pari avant un mouvement).</i>\n"
+        f"{_analyst_legend()}\n"
     )
     if df_stealth is not None and not df_stealth.empty:
         message += "<b>Signaux détectés</b>\n"
@@ -2253,8 +2277,7 @@ def _format_highlight_stock(row, options_map):
             line = line.replace("\n📰", extra + "\n📰", 1)
         else:
             line += extra
-    if row.get("Signal") == "x2":
-        line += " | 🎯 x2"
+
     return line + "\n"
 
 
@@ -2273,7 +2296,8 @@ def format_highlights_telegram(stock_highlights, etf_highlights, spy_ret_20d, op
     message = (
         "🚀 <b>AnisTrade — Highlights</b>\n"
         f"{_spy_header(spy_ret_20d)}"
-        "<i>Notre sélection du jour : actions et ETF les plus prometteurs.</i>\n\n"
+        "<i>Notre sélection du jour : actions et ETF les plus prometteurs.</i>\n"
+        f"{_analyst_legend()}\n"
         "<b>📈 Meilleures actions</b>\n"
     )
     if stock_highlights:
