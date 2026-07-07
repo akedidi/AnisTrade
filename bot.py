@@ -36,7 +36,7 @@ RUNNER_SCREENERS = [
     "most_shorted_stocks",
     "day_gainers",
 ]
-ALL_STOCK_SCREENERS = RUNNER_SCREENERS + ["most_actives"]
+ALL_STOCK_SCREENERS = RUNNER_SCREENERS + ["most_actives", "day_losers"]
 SCREENER_COUNT = 250
 SCREENER_DELAY_SEC = 0.2
 
@@ -791,7 +791,7 @@ def _extract_screener_quotes(quotes, quote_type="EQUITY"):
 def fetch_screener_universe():
     log("📡 Screeners Yahoo (rising stars)...")
     stock_quotes = {}
-    sources = {"small_cap": set(), "aggressive": set(), "shorted": set(), "gainers": set(), "actives": set()}
+    sources = {"small_cap": set(), "aggressive": set(), "shorted": set(), "gainers": set(), "actives": set(), "losers": set()}
     for name in ALL_STOCK_SCREENERS:
         try:
             resp = yf.screen(name, count=SCREENER_COUNT)
@@ -805,6 +805,7 @@ def fetch_screener_universe():
                 "most_shorted_stocks": "shorted",
                 "day_gainers": "gainers",
                 "most_actives": "actives",
+                "day_losers": "losers",
             }.get(name)
             if key:
                 sources[key] |= set(found.keys())
@@ -824,6 +825,8 @@ def _screener_priority(sym, sources):
     if sym in sources["aggressive"]:
         score += 3
     if sym in sources["gainers"]:
+        score += 1
+    if sym in sources.get("losers", set()):
         score += 1
     return score
 
@@ -916,8 +919,10 @@ def annualized_volatility(closes, days=30):
     return float(rets.std() * (252 ** 0.5) * 100)
 
 
-def risk_level(beta, short_pct, vol_30d, category=None):
+def risk_level(beta, short_pct, vol_30d, category=None, detection_type=None):
     """Risque composite : beta, short interest, volatilité 30j → Faible / Moyen / Élevé."""
+    if detection_type == "Volume Squeeze":
+        return "Spéculatif", "🎲"
     points = 0
     components = 0
     is_biotech = category == "Biotech"
@@ -1484,7 +1489,7 @@ def global_score(momentum, analyst, options, sentiment):
 
 
 def compute_scores(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating,
-                   is_buy, target_upside, price, finnhub, top_vol_oi=None):
+                   is_buy, target_upside, price, finnhub, top_vol_oi=None, detection_type=None):
     accelerating = accelerating or (
         var_5d is not None and var_20d is not None and var_5d > 0 and var_5d > (var_20d / 4)
     )
@@ -1495,6 +1500,11 @@ def compute_scores(var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accel
     g = global_score(m, a, o, s)
     if not _is_valid_num(g):
         g = global_score(_score_component(m), _score_component(a), _score_component(o), s)
+    
+    if detection_type == "Volume Squeeze" and top_vol_oi and top_vol_oi >= 5.0:
+        g = max(g, 65.0 + min(top_vol_oi, 20.0))
+        o = max(o, 80)
+        
     return m, a, o, s, g
 
 
@@ -1519,6 +1529,7 @@ def _recompute_row_scores(row, meta=None, options_map=None, stealth=None):
         r.get("Var1j"), r.get("Var5j"), r.get("Var20j"), r.get("RS20j"), r.get("VolRatio"),
         r.get("Shorted"), _row_is_accelerating(r),
         r.get("AnalystBuy"), target_upside, r.get("Prix"), meta, top_vol_oi,
+        detection_type=r.get("DetectionType")
     )
     r.update({
         "MomentumScore": m, "AnalystScore": a, "OptionsScore": o,
@@ -1548,17 +1559,18 @@ def get_spy_benchmark():
     return pct_return(closes["SPY"], 20)
 
 
-def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, finnhub, vol_30d=None, top_vol_oi=None):
+def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, finnhub, vol_30d=None, top_vol_oi=None, detection_type=None):
     is_shorted = ticker in sources["shorted"]
     accelerating = var_5d is not None and var_20d is not None and var_5d > 0 and var_5d > (var_20d / 4)
     fh = finnhub or {}
     m, a, o, s, g = compute_scores(
         var_1d, var_5d, var_20d, rs_20d, vol_ratio, is_shorted, accelerating,
         analyst.get("is_buy", False), analyst.get("upside_pct"), price, fh, top_vol_oi,
+        detection_type=detection_type
     )
     beta, short_pct = analyst.get("beta"), analyst.get("short_pct")
     category = analyst.get("category", "Autre")
-    risk_label, risk_emoji = risk_level(beta, short_pct, vol_30d, category)
+    risk_label, risk_emoji = risk_level(beta, short_pct, vol_30d, category, detection_type)
     catalyst = future_catalyst_only(fh.get("catalyst"))
     if not catalyst and analyst.get("earnings_date"):
         catalyst = future_catalyst_only(f"Résultats le {analyst['earnings_date']}")
@@ -1592,6 +1604,7 @@ def _build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analys
         "SocialPct": fh.get("social_pct"),
         "BullishPct": fh.get("bullish_pct"),
         "NegativeFdaNews": fh.get("negative_fda_news", False),
+        "DetectionType": detection_type,
     }
 
 
@@ -1687,11 +1700,16 @@ def analyze_candidates(tickers, sources, spy_ret_20d, precatalyst_tickers=None):
 
         if var_20d is not None and var_20d > RUNNER_MAX_VAR20:
             if price >= EXTENDED_MIN_PRICE:
-                extended.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, vol_30d))
+                extended.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, vol_30d, detection_type="Extended"))
             continue
 
         if var_20d is None or var_20d < RUNNER_MIN_VAR20 or (rs_20d is not None and rs_20d < 0):
-            if (
+            if vol_ratio >= 2.5 and -10.0 <= (var_20d or 0.0) <= 15.0:
+                momentum_pool.append(_build_row(
+                    ticker, price, var_1d, var_5d, var_20d or 0, rs_20d or 0,
+                    vol_ratio, analyst, sources, {}, vol_30d, detection_type="Volume Squeeze"
+                ))
+            elif (
                 ticker in precatalyst_set
                 and analyst.get("category") == "Biotech"
                 and (var_20d is None or var_20d <= BIOTECH_PRE_CATALYST_MAX_VAR20)
@@ -1699,11 +1717,11 @@ def analyze_candidates(tickers, sources, spy_ret_20d, precatalyst_tickers=None):
             ):
                 momentum_pool.append(_build_row(
                     ticker, price, var_1d, var_5d, var_20d or 0, rs_20d or 0,
-                    vol_ratio, analyst, sources, {}, vol_30d,
+                    vol_ratio, analyst, sources, {}, vol_30d, detection_type="Pre-Catalyst"
                 ))
             continue
 
-        momentum_pool.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, vol_30d))
+        momentum_pool.append(_build_row(ticker, price, var_1d, var_5d, var_20d, rs_20d, vol_ratio, analyst, sources, {}, vol_30d, detection_type="Momentum"))
 
     runners, stealth_pool = [], []
     for row in momentum_pool:
@@ -1718,7 +1736,7 @@ def analyze_candidates(tickers, sources, spy_ret_20d, precatalyst_tickers=None):
     if not df_runners.empty:
         df_runners = df_runners.sort_values(by=["Score", "Var20j"], ascending=False)
     if not df_stealth_pool.empty:
-        df_stealth_pool = df_stealth_pool.sort_values(by=["Score", "Var20j"], ascending=False)
+        df_stealth_pool = df_stealth_pool.sort_values(by="VolRatio", ascending=False)
     if not df_extended.empty:
         df_extended = df_extended.sort_values(by="Var20j", ascending=False)
 
@@ -1996,6 +2014,13 @@ def _format_compact_stock(row, options_map=None, stealth=False, highlight_ticker
     if prix_s:
         parts.append(prix_s)
     parts.extend([f"Score {score} {risk}", f"{var_s} sur 20 j"])
+    
+    det = row.get("DetectionType")
+    if det == "Volume Squeeze":
+        parts.append("🐳 Thèse : Accumulation Furtive / Flux d'Options")
+    elif det in ("Momentum", "Pre-Catalyst") or (row.get("Score") and float(row.get("Score")) >= 60):
+        parts.append("🎯 Thèse : Analyste/Fondamentale")
+        
     parts.extend(_format_analyst_parts(row))
     if options_map:
         vol_oi = _effective_whale_vol_oi(row, options_map, stealth=stealth)
